@@ -35,11 +35,11 @@ const (
 )
 
 var imageSizeToAspectRatio = map[string]string{
-	"1024x1024":  "1:1",
-	"1024x1536":  "2:3",
-	"1536x1024":  "3:2",
-	"1024x1792":  "9:16",
-	"1792x1024":  "16:9",
+	"1024x1024": "1:1",
+	"1024x1536": "2:3",
+	"1536x1024": "3:2",
+	"1024x1792": "9:16",
+	"1792x1024": "16:9",
 }
 
 var sizePattern = regexp.MustCompile(`^\d+x\d+$`)
@@ -72,12 +72,12 @@ func (l *QueueLease) Release() {
 
 // ConcurrentRequestQueue 并发请求队列
 type ConcurrentRequestQueue struct {
-	logger         *slog.Logger
-	waitTimeout    time.Duration
-	maxConcurrency int
-	mu             *sync.Cond
-	nextTicket     int
-	servingTicket  int
+	logger          *slog.Logger
+	waitTimeout     time.Duration
+	maxConcurrency  int
+	mu              *sync.Cond
+	nextTicket      int
+	servingTicket   int
 	releasedTickets map[int]bool
 }
 
@@ -158,11 +158,11 @@ func (q *ConcurrentRequestQueue) release(ticket int) {
 
 // Client GLM Web 客户端
 type Client struct {
-	config        *config.AppConfig
-	logger        *slog.Logger
-	Auth          *auth.Manager
-	RequestQueue  *ConcurrentRequestQueue
-	httpClient    *http.Client
+	config       *config.AppConfig
+	logger       *slog.Logger
+	Auth         *auth.Manager
+	RequestQueue *ConcurrentRequestQueue
+	httpClient   *http.Client
 }
 
 // NewClient 创建 GLM 客户端
@@ -450,9 +450,6 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 		}
 	}
 
-	chatMode := translator.ResolveChatMode(requestedModel, openaiPayload["reasoning_effort"], openaiPayload["deep_research"])
-	isNetworking := translator.ResolveNetworking(requestedModel, openaiPayload["web_search"])
-
 	requestBody := map[string]any{
 		"assistant_id":    assistantID,
 		"conversation_id": "",
@@ -460,28 +457,20 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 		"chat_type":       "user_chat",
 		"messages":        convertedMessages,
 		"meta_data": map[string]any{
-			"channel":              "",
-			"chat_mode":            "thinking",
-			"draft_id":             "",
-			"if_plus_model":        true,
-			"input_question_type":  "xxxx",
-			"is_networking":        false,
-			"is_test":              false,
-			"platform":             "pc",
-			"quote_log_id":         "",
-			"cogview":              map[string]any{"rm_label_watermark": false},
+			"channel":             "",
+			"chat_mode":           "thinking",
+			"draft_id":            "",
+			"if_plus_model":       true,
+			"input_question_type": "xxxx",
+			"is_networking":       false,
+			"is_test":             false,
+			"platform":            "pc",
+			"quote_log_id":        "",
+			"cogview":             map[string]any{"rm_label_watermark": false},
 		},
-	}
-	// 设置 chat_mode 和 is_networking
-	if metaData, ok := requestBody["meta_data"].(map[string]any); ok {
-		if chatMode != "" {
-			metaData["chat_mode"] = chatMode
-		}
-		metaData["is_networking"] = isNetworking
 	}
 
 	bodyBytes, _ := json.Marshal(requestBody)
-
 	c.logger.Info("转发请求", "model", requestedModel, "upstream", upstreamModel, "stream", openaiPayload["stream"])
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "转发到 GLM 的 chat 原始请求体", bodyBytes)
 
