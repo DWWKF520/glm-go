@@ -9,9 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"glm2api/internal/config"
 	"glm2api/internal/logging"
-	"glm2api/internal/models"
 	"glm2api/internal/tools"
 )
 
@@ -317,40 +315,6 @@ func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string) []map[str
 		})
 	}
 	return sanitized
-}
-
-// ResolveUpstreamModel 解析上游模型和 assistant_id
-func ResolveUpstreamModel(requestedModel string, cfg *config.AppConfig) (string, string) {
-	baseModel, _ := models.SplitModelFeatures(requestedModel)
-	upstreamModel := baseModel
-	if alias, ok := cfg.ModelAliases[baseModel]; ok && alias != "" {
-		upstreamModel = alias
-	}
-	assistantID := cfg.GLMAssistantID
-	if assistantIDPattern.MatchString(upstreamModel) {
-		assistantID = upstreamModel
-	}
-	return upstreamModel, assistantID
-}
-
-// ResolveChatMode 解析聊天模式
-func ResolveChatMode(model string, reasoningEffort any, deepResearch any) string {
-	lowerModel := strings.ToLower(model)
-	if deepResearch != nil || strings.Contains(lowerModel, "deepresearch") || strings.Contains(lowerModel, "deep-research") {
-		return "deep_research"
-	}
-	if reasoningEffort != nil || models.ModelRequestsThinking(model) || strings.Contains(lowerModel, "think") || strings.Contains(lowerModel, "zero") {
-		return "zero"
-	}
-	return ""
-}
-
-// ResolveNetworking 解析是否启用联网搜索
-func ResolveNetworking(model string, webSearch any) bool {
-	if webSearch != nil {
-		return true
-	}
-	return models.ModelRequestsSearch(model)
 }
 
 // ConvertMessages 将 OpenAI 消息列表转换为 GLM 格式

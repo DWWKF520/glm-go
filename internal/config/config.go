@@ -7,16 +7,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	"glm2api/internal/models"
 )
 
 const (
-	DefaultAssistantID       = "6a28c9a9a499f6cbf77bfef3"
-	DefaultImageAssistantID  = "65a232c082ff90a2ad2f15e2"
-	DefaultImageModelName    = "glm-image-1"
-	DefaultGLMBaseURL        = "https://chatglm.cn/chatglm"
-	GuestRefreshTokenMarker  = "__glm_guest__"
+	DefaultAssistantID      = "6a28c9a9a499f6cbf77bfef3"
+	DefaultImageAssistantID = "65a232c082ff90a2ad2f15e2"
+	DefaultImageModelName   = "glm-image-1"
+	DefaultGLMBaseURL       = "https://chatglm.cn/chatglm"
+	GuestRefreshTokenMarker = "__glm_guest__"
 )
 
 var (
@@ -43,8 +41,8 @@ var (
 		DefaultImageModelName,
 	}
 	ModelVariantExcludedModels = map[string]bool{
-		"cogView-4-250304":     true,
-		DefaultImageModelName:  true,
+		"cogView-4-250304":    true,
+		DefaultImageModelName: true,
 	}
 	DefaultBlockedToolNames = []string{}
 )
@@ -60,35 +58,35 @@ func NewConfigError(msg string) error { return &ConfigError{msg: msg} }
 
 // AppConfig 应用配置
 type AppConfig struct {
-	EnvFile                       string
-	EnvFileCreated                bool
-	TokenFile                     string
-	Host                          string
-	Port                          int
-	APIPrefix                     string
-	LogLevel                      string
-	LogFile                       string
-	DebugDumpAll                  bool
-	RequestTimeout                int
-	GLMBaseURL                    string
-	GLMUseGuestRefreshToken       bool
-	GLMRefreshToken               string
-	GLMRefreshTokens              []string
-	GLMAssistantID                string
-	GLMImageAssistantID           string
-	GLMImageModelName             string
-	GLMUserAgent                  string
-	GLMDeleteConversation         bool
-	GLMMaxConcurrency             int
-	GLMQueueWaitTimeout           int
-	GLMBusyMaxRetries             int
-	GLMBusyRetryInterval          float64
-	GLMGuestMaxRetries            int
-	BlockedToolNames              []string
-	ExposedModels                 []string
-	ModelAliases                  map[string]string
-	ServerAPIKeys                 []string
-	CORSAllowOrigin               string
+	EnvFile                 string
+	EnvFileCreated          bool
+	TokenFile               string
+	Host                    string
+	Port                    int
+	APIPrefix               string
+	LogLevel                string
+	LogFile                 string
+	DebugDumpAll            bool
+	RequestTimeout          int
+	GLMBaseURL              string
+	GLMUseGuestRefreshToken bool
+	GLMRefreshToken         string
+	GLMRefreshTokens        []string
+	GLMAssistantID          string
+	GLMImageAssistantID     string
+	GLMImageModelName       string
+	GLMUserAgent            string
+	GLMDeleteConversation   bool
+	GLMMaxConcurrency       int
+	GLMQueueWaitTimeout     int
+	GLMBusyMaxRetries       int
+	GLMBusyRetryInterval    float64
+	GLMGuestMaxRetries      int
+	BlockedToolNames        []string
+	ExposedModels           []string
+	ModelAliases            map[string]string
+	ServerAPIKeys           []string
+	CORSAllowOrigin         string
 }
 
 // RefreshURL 刷新 token URL
@@ -373,11 +371,6 @@ func LoadConfig(envFile string) (*AppConfig, error) {
 	}
 	logFilePath := strings.TrimSpace(values["LOG_FILE_PATH"])
 	imageModelName := DefaultImageModelName
-	exposedModels := models.ExpandModelVariants(BuiltinExposedModels, ModelVariantExcludedModels)
-	modelAliases := make(map[string]string)
-	for _, name := range BuiltinExposedModels {
-		modelAliases[name] = name
-	}
 
 	port, err := ParseInt(values["PORT"], 8000)
 	if err != nil {
@@ -410,35 +403,33 @@ func LoadConfig(envFile string) (*AppConfig, error) {
 	defaultUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
 
 	config := &AppConfig{
-		EnvFile:                       envPath,
-		EnvFileCreated:                envFileCreated,
-		TokenFile:                     tokenFile,
-		Host:                          host,
-		Port:                          port,
-		APIPrefix:                     apiPrefix,
-		LogLevel:                      logLevel,
-		LogFile:                       logFilePath,
-		DebugDumpAll:                  debugDumpAll,
-		RequestTimeout:                requestTimeout,
-		GLMBaseURL:                    strings.TrimRight(getOrDefault(values, "GLM_BASE_URL", DefaultGLMBaseURL), "/"),
-		GLMUseGuestRefreshToken:       explicitGuestMode,
-		GLMRefreshToken:               singleRefreshToken,
-		GLMRefreshTokens:              refreshTokens,
-		GLMAssistantID:                strings.TrimSpace(getOrDefault(values, "GLM_ASSISTANT_ID", DefaultAssistantID)),
-		GLMImageAssistantID:           strings.TrimSpace(getOrDefault(values, "GLM_IMAGE_ASSISTANT_ID", DefaultImageAssistantID)),
-		GLMImageModelName:             imageModelName,
-		GLMUserAgent:                  strings.TrimSpace(getOrDefault(values, "GLM_USER_AGENT", defaultUA)),
-		GLMDeleteConversation:         ParseBool(values["GLM_DELETE_CONVERSATION"], true),
-		GLMMaxConcurrency:             glmMaxConcurrency,
-		GLMQueueWaitTimeout:           queueWaitTimeout,
-		GLMBusyMaxRetries:             busyMaxRetries,
-		GLMBusyRetryInterval:          busyRetryInterval,
-		GLMGuestMaxRetries:            guestMaxRetries,
-		BlockedToolNames:              ParseList(values["BLOCKED_TOOL_NAMES"], DefaultBlockedToolNames),
-		ExposedModels:                 exposedModels,
-		ModelAliases:                  modelAliases,
-		ServerAPIKeys:                 ParseList(values["SERVER_API_KEYS"], nil),
-		CORSAllowOrigin:               getOrDefault(values, "CORS_ALLOW_ORIGIN", "*"),
+		EnvFile:                 envPath,
+		EnvFileCreated:          envFileCreated,
+		TokenFile:               tokenFile,
+		Host:                    host,
+		Port:                    port,
+		APIPrefix:               apiPrefix,
+		LogLevel:                logLevel,
+		LogFile:                 logFilePath,
+		DebugDumpAll:            debugDumpAll,
+		RequestTimeout:          requestTimeout,
+		GLMBaseURL:              strings.TrimRight(getOrDefault(values, "GLM_BASE_URL", DefaultGLMBaseURL), "/"),
+		GLMUseGuestRefreshToken: explicitGuestMode,
+		GLMRefreshToken:         singleRefreshToken,
+		GLMRefreshTokens:        refreshTokens,
+		GLMAssistantID:          strings.TrimSpace(getOrDefault(values, "GLM_ASSISTANT_ID", DefaultAssistantID)),
+		GLMImageAssistantID:     strings.TrimSpace(getOrDefault(values, "GLM_IMAGE_ASSISTANT_ID", DefaultImageAssistantID)),
+		GLMImageModelName:       imageModelName,
+		GLMUserAgent:            strings.TrimSpace(getOrDefault(values, "GLM_USER_AGENT", defaultUA)),
+		GLMDeleteConversation:   ParseBool(values["GLM_DELETE_CONVERSATION"], true),
+		GLMMaxConcurrency:       glmMaxConcurrency,
+		GLMQueueWaitTimeout:     queueWaitTimeout,
+		GLMBusyMaxRetries:       busyMaxRetries,
+		GLMBusyRetryInterval:    busyRetryInterval,
+		GLMGuestMaxRetries:      guestMaxRetries,
+		BlockedToolNames:        ParseList(values["BLOCKED_TOOL_NAMES"], DefaultBlockedToolNames),
+		ServerAPIKeys:           ParseList(values["SERVER_API_KEYS"], nil),
+		CORSAllowOrigin:         getOrDefault(values, "CORS_ALLOW_ORIGIN", "*"),
 	}
 
 	if config.Port < 1 || config.Port > 65535 {

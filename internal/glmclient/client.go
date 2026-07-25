@@ -407,11 +407,8 @@ func (c *Client) resolveTools(openaiPayload map[string]any) ([]map[string]any, m
 }
 
 func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]any, preferredAccountIndex *int) (*http.Response, string, error) {
-	requestedModel, _ := openaiPayload["model"].(string)
-	if requestedModel == "" {
-		requestedModel = "glm-4-think"
-	}
-	upstreamModel, assistantID := translator.ResolveUpstreamModel(requestedModel, c.config)
+	upstreamModel := openaiPayload["model"].(string)
+	assistantID := c.config.GLMAssistantID
 	filteredTools, _ := c.resolveTools(openaiPayload)
 
 	blockedToolNames := map[string]bool{}
@@ -471,7 +468,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 	}
 
 	bodyBytes, _ := json.Marshal(requestBody)
-	c.logger.Info("转发请求", "model", requestedModel, "upstream", upstreamModel, "stream", openaiPayload["stream"])
+	c.logger.Info("转发请求", "upstream", upstreamModel, "stream", openaiPayload["stream"])
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "转发到 GLM 的 chat 原始请求体", bodyBytes)
 
 	operation := func(accountIndex int, accessToken string) (any, error) {
@@ -538,7 +535,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 		return nil, &UpstreamAPIError{StatusCode: 429, Message: "GLM 长时间忙碌，请稍后重试。"}
 	}
 
-	respAny, err := c.callWithAccountFailover(ctx, fmt.Sprintf("chat:%s", requestedModel), operation, preferredAccountIndex)
+	respAny, err := c.callWithAccountFailover(ctx, fmt.Sprintf("chat:%s", upstreamModel), operation, preferredAccountIndex)
 	if err != nil {
 		return nil, "", err
 	}

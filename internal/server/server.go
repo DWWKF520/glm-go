@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -55,7 +54,6 @@ func (s *Server) setupRouter() {
 
 	v1 := r.Group(s.config.APIPrefix)
 	{
-		v1.GET("/models", s.handleListModels)
 		v1.POST("/chat/completions", s.handleChatCompletions)
 		v1.POST("/images/generations", s.handleImagesGenerations)
 	}
@@ -208,27 +206,6 @@ func (s *Server) handleRoot(c *gin.Context) {
 	})
 }
 
-func (s *Server) handleListModels(c *gin.Context) {
-	// 按字母排序
-	models := make([]string, len(s.config.ExposedModels))
-	copy(models, s.config.ExposedModels)
-	sort.Strings(models)
-
-	data := make([]gin.H, 0, len(models))
-	for _, m := range models {
-		data = append(data, gin.H{
-			"id":       m,
-			"object":   "model",
-			"created":  startTime.Unix(),
-			"owned_by": "chatglm.cn",
-		})
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"object": "list",
-		"data":   data,
-	})
-}
-
 func (s *Server) handleChatCompletions(c *gin.Context) {
 	var payload map[string]any
 	if err := c.ShouldBindJSON(&payload); err != nil {
@@ -325,5 +302,3 @@ func (s *Server) writeError(c *gin.Context, err error) {
 	}
 	c.JSON(status, payload)
 }
-
-
