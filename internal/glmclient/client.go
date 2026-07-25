@@ -6,7 +6,6 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
-	"github.com/bytedance/sonic"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bytedance/sonic"
 
 	"github.com/google/uuid"
 
@@ -213,7 +214,7 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 		defer close(out)
 		defer func() {
 			response.Body.Close()
-			c.DeleteConversation(ctx, accumulator.ConversationID, assistantID)
+			c.DeleteConversation(context.Background(), accumulator.ConversationID, assistantID)
 			lease.Release()
 		}()
 
@@ -270,7 +271,7 @@ func (c *Client) GenerateImages(ctx context.Context, payload map[string]any) (ma
 
 	defer func() {
 		response.Body.Close()
-		c.DeleteConversation(ctx, accumulator.ConversationID, assistantID)
+		c.DeleteConversation(context.Background(), accumulator.ConversationID, assistantID)
 		lease.Release()
 	}()
 
