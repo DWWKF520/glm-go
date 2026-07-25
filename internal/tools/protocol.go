@@ -1,7 +1,7 @@
 package tools
 
 import (
-	"encoding/json"
+	"github.com/bytedance/sonic"
 	"fmt"
 	"regexp"
 	"sort"
@@ -32,7 +32,7 @@ const CanonicalToolCallExample = "[function_calls]\n" +
 
 // SafeJSONDumps 安全 JSON 序列化（不转义 HTML）
 func SafeJSONDumps(v any) string {
-	data, err := json.Marshal(v)
+	data, err := sonic.Marshal(v)
 	if err != nil {
 		return "{}"
 	}
@@ -42,7 +42,7 @@ func SafeJSONDumps(v any) string {
 
 // SafeJSONDumpsCompact 紧凑 JSON 序列化
 func SafeJSONDumpsCompact(v any) string {
-	data, err := json.Marshal(v)
+	data, err := sonic.Marshal(v)
 	if err != nil {
 		return "{}"
 	}
@@ -100,7 +100,7 @@ func NormalizeArguments(payload any) map[string]any {
 			return map[string]any{}
 		}
 		var v any
-		if err := json.Unmarshal([]byte(s), &v); err != nil {
+		if err := sonic.Unmarshal([]byte(s), &v); err != nil {
 			return map[string]any{"raw": s}
 		}
 		parsed = v

@@ -200,7 +200,6 @@ func (s *Server) handleRoot(c *gin.Context) {
 		"version": "1.0.0",
 		"endpoints": gin.H{
 			"chat":   s.config.APIPrefix + "/chat/completions",
-			"models": s.config.APIPrefix + "/models",
 			"images": s.config.APIPrefix + "/images/generations",
 		},
 	})

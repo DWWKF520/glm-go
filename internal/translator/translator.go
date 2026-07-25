@@ -1,7 +1,7 @@
 package translator
 
 import (
-	"encoding/json"
+	"github.com/bytedance/sonic"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -118,7 +118,7 @@ func SanitizeToolCallPayload(toolName string, arguments any, fallbackURL string)
 	parsedArguments := arguments
 	if s, ok := arguments.(string); ok {
 		var v any
-		if err := json.Unmarshal([]byte(s), &v); err == nil {
+		if err := sonic.Unmarshal([]byte(s), &v); err == nil {
 			parsedArguments = v
 		} else {
 			return nil
@@ -175,7 +175,7 @@ func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string) []map[str
 		originalValue := originalArguments
 		if s, ok := originalArguments.(string); ok {
 			var v any
-			if err := json.Unmarshal([]byte(s), &v); err == nil {
+			if err := sonic.Unmarshal([]byte(s), &v); err == nil {
 				originalValue = v
 			} else {
 				originalValue = s

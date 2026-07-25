@@ -6,7 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
-	"encoding/json"
+	"github.com/bytedance/sonic"
 	"fmt"
 	"io"
 	"log/slog"
@@ -303,7 +303,7 @@ func (c *Client) DeleteConversation(ctx context.Context, conversationID, assista
 		actualAssistantID = c.config.GLMAssistantID
 	}
 
-	body, _ := json.Marshal(map[string]any{
+	body, _ := sonic.Marshal(map[string]any{
 		"assistant_id":    actualAssistantID,
 		"conversation_id": conversationID,
 	})
@@ -467,7 +467,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 		},
 	}
 
-	bodyBytes, _ := json.Marshal(requestBody)
+	bodyBytes, _ := sonic.Marshal(requestBody)
 	c.logger.Info("转发请求", "upstream", upstreamModel, "stream", openaiPayload["stream"])
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "转发到 GLM 的 chat 原始请求体", bodyBytes)
 
@@ -596,7 +596,7 @@ func (c *Client) openImageStream(ctx context.Context, payload map[string]any, pr
 			},
 		},
 	}
-	bodyBytes, _ := json.Marshal(requestBody)
+	bodyBytes, _ := sonic.Marshal(requestBody)
 
 	c.logger.Info("转发绘图请求", "model", userModel, "assistant_id", c.config.GLMImageAssistantID, "size", size, "n", payload["n"])
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "OpenAI 原始 image 请求 payload", payload)
@@ -662,7 +662,7 @@ func (c *Client) prepareChatResponse(resp *http.Response) (*http.Response, error
 				Payload:    payload,
 			}
 		}
-		bodyBytes, _ := json.Marshal(payload)
+		bodyBytes, _ := sonic.Marshal(payload)
 		// 创建新响应
 		newResp := &http.Response{
 			Status:     "200 OK",
@@ -856,7 +856,7 @@ func (c *Client) iterSSEEvents(body io.Reader) <-chan map[string]any {
 				return
 			}
 			var parsed map[string]any
-			if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+			if err := sonic.Unmarshal([]byte(payload), &parsed); err != nil {
 				c.logger.Debug("忽略无法解析的 SSE 片段", "payload", payload)
 				return
 			}
@@ -1132,7 +1132,7 @@ func (c *Client) readErrorPayload(resp *http.Response) map[string]any {
 	}
 	text := string(data)
 	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err == nil {
+	if err := sonic.Unmarshal(data, &payload); err == nil {
 		return payload
 	}
 	return map[string]any{"message": text}
@@ -1384,7 +1384,7 @@ func formatErrorChunk(err error) string {
 			"type":    "upstream_error",
 		},
 	}
-	data, _ := json.Marshal(errPayload)
+	data, _ := sonic.Marshal(errPayload)
 	return "data: " + string(data) + "\n\n"
 }
 

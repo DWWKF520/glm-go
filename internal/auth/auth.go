@@ -5,7 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
-	"encoding/json"
+	"github.com/bytedance/sonic"
 	"fmt"
 	"io"
 	"log/slog"
@@ -193,7 +193,7 @@ func (m *Manager) ReadJSONResponse(resp *http.Response) (map[string]any, error) 
 	logging.DebugDump(m.logger, m.config.DebugDumpAll, "GLM 原始 JSON 响应体", data)
 
 	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
+	if err := sonic.Unmarshal(data, &payload); err != nil {
 		return nil, fmt.Errorf("GLM 响应不是合法 JSON: %w", err)
 	}
 	return payload, nil

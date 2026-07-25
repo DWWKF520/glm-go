@@ -1,7 +1,7 @@
 package tools
 
 import (
-	"encoding/json"
+	"github.com/bytedance/sonic"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -86,7 +86,7 @@ func IsAllowedToolName(toolName string, allowedToolNames map[string]bool) bool {
 
 // BuildToolCall 构建工具调用对象
 func BuildToolCall(name string, arguments map[string]any, index int) map[string]any {
-	argsBytes, _ := json.Marshal(arguments)
+	argsBytes, _ := sonic.Marshal(arguments)
 	return map[string]any{
 		"id":    "call_" + uuid.New().String()[:24],
 		"type":  "function",
@@ -131,12 +131,12 @@ func TryParseJSON(text string) any {
 		return nil
 	}
 	var v any
-	if err := json.Unmarshal([]byte(stripped), &v); err == nil {
+	if err := sonic.Unmarshal([]byte(stripped), &v); err == nil {
 		return v
 	}
 	// 修复尾随逗号
 	repaired := trailingCommaRE.ReplaceAllString(stripped, "$1")
-	if err := json.Unmarshal([]byte(repaired), &v); err == nil {
+	if err := sonic.Unmarshal([]byte(repaired), &v); err == nil {
 		return v
 	}
 	return nil
