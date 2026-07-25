@@ -410,11 +410,6 @@ func ConvertMessages(
 
 	prompt := strings.TrimSpace(strings.Join(transcriptParts, "\n"))
 
-	// 截取 <system-reminder> 之后的内容
-	if loc := systemReminderRE.FindStringIndex(prompt); loc != nil {
-		prompt = prompt[loc[0]:]
-	}
-
 	// 在本地文件路径后追加提示（跳过已带提示的路径，与 Python 负向后顾断言一致）
 	prompt = appendLocalFileHints(prompt)
 

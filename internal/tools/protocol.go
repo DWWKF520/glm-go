@@ -1,11 +1,12 @@
 package tools
 
 import (
-	"github.com/bytedance/sonic"
 	"fmt"
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/bytedance/sonic"
 )
 
 // 被屏蔽的原生工具名
@@ -27,7 +28,7 @@ var ServerSideToolNames = map[string]bool{}
 
 // CanonicalToolCallExample 工具调用示例
 const CanonicalToolCallExample = "[function_calls]\n" +
-	`[call:TOOL_NAME]{"actual_parameter_name":"value"}[/call]` + "\n" +
+	`[call:TOOL_NAME_1]{"actual_parameter_name":"value"}[/call]` + "\n" + `[call:TOOL_NAME_2]{"actual_parameter_name":"value"}[/call]` + "\n" +
 	"[/function_calls]"
 
 // SafeJSONDumps 安全 JSON 序列化（不转义 HTML）
