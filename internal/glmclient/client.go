@@ -224,9 +224,14 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 				continue
 			}
 			if err := c.raiseForEventError(event, true); err != nil {
-				// 发送错误事件后退出
-				out <- []byte(formatErrorChunk(err))
-				return
+				cleaned := c.filterErrorParts(event)
+				if len(cleaned) > 0 {
+					c.logger.Warn("GLM 流式事件包含错误 part，已过滤", "error", err, "filtered_parts", len(cleaned))
+					event["parts"] = cleaned
+				} else {
+					out <- []byte(formatErrorChunk(err))
+					return
+				}
 			}
 			chunks, status := accumulator.ConsumeEvent(event)
 			for _, chunk := range chunks {
@@ -1238,6 +1243,29 @@ func (c *Client) extractEventError(event map[string]any) map[string]any {
 		}
 	}
 	return nil
+}
+
+func (c *Client) filterErrorParts(event map[string]any) []any {
+	parts, ok := event["parts"].([]any)
+	if !ok {
+		return nil
+	}
+	var cleaned []any
+	for _, p := range parts {
+		part, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, hasErr := part["error"].(map[string]any); hasErr {
+			continue
+		}
+		partStatus, _ := part["status"].(string)
+		if strings.ToLower(strings.TrimSpace(partStatus)) == "error" {
+			continue
+		}
+		cleaned = append(cleaned, part)
+	}
+	return cleaned
 }
 
 func (c *Client) getPreferredAccountIndex(ticket int) *int {

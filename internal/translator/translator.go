@@ -1,13 +1,14 @@
 package translator
 
 import (
-	"github.com/bytedance/sonic"
 	"fmt"
 	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/bytedance/sonic"
 
 	"glm2api/internal/logging"
 	"glm2api/internal/tools"
@@ -18,7 +19,7 @@ var (
 	urlPattern         = regexp.MustCompile(`https?://[^\s<>()"']+`)
 )
 
-const LocalFileHint = "(本地文件，不在服务区上，应该用json工具)"
+const LocalFileHint = "(本地文件，不在服务区上，应该用[function_calls]工具)"
 
 var (
 	systemReminderRE = regexp.MustCompile(`(?s)<system-reminder>.*`)
@@ -30,7 +31,7 @@ var (
 func removeLocalFileHint(v any) any {
 	switch x := v.(type) {
 	case string:
-		return strings.ReplaceAll(x, LocalFileHint, "")
+		return strings.TrimSpace(strings.ReplaceAll(x, LocalFileHint, ""))
 	case map[string]any:
 		result := make(map[string]any, len(x))
 		for k, val := range x {
@@ -46,6 +47,33 @@ func removeLocalFileHint(v any) any {
 	default:
 		return v
 	}
+}
+
+// appendLocalFileHints 在本地文件路径后追加提示。
+// 模拟 Python 的 (?<!LOCAL_FILE_HINT) 负向后顾断言：若路径已紧随提示则不重复追加。
+func appendLocalFileHints(prompt string) string {
+	matches := localFilePathRE.FindAllStringIndex(prompt, -1)
+	if len(matches) == 0 {
+		return prompt
+	}
+	hintLen := len(LocalFileHint)
+	var b strings.Builder
+	lastEnd := 0
+	for _, loc := range matches {
+		start, end := loc[0], loc[1]
+		b.WriteString(prompt[lastEnd:start])
+		match := prompt[start:end]
+		if start >= hintLen && prompt[start-hintLen:start] == LocalFileHint {
+			// 路径前已是提示，跳过避免重复
+			b.WriteString(match)
+		} else {
+			b.WriteString(match)
+			b.WriteString(LocalFileHint)
+		}
+		lastEnd = end
+	}
+	b.WriteString(prompt[lastEnd:])
+	return b.String()
 }
 
 // ExtractTextContent 从消息内容中提取文本
@@ -65,7 +93,9 @@ func ExtractTextContent(content any) string {
 			itemType, _ := m["type"].(string)
 			switch itemType {
 			case "text":
-				parts = append(parts, fmt.Sprintf("%v", m["text"]))
+				if t, ok := m["text"]; ok && t != nil {
+					parts = append(parts, fmt.Sprintf("%v", t))
+				}
 			case "image_url":
 				url := ""
 				if iu, ok := m["image_url"].(map[string]any); ok {
@@ -80,7 +110,7 @@ func ExtractTextContent(content any) string {
 				parts = append(parts, "[file:"+url+"]")
 			}
 		}
-		return strings.Join(parts, "\n")
+		return strings.Join(filterEmpty(parts), "\n")
 	default:
 		return ""
 	}
@@ -385,10 +415,8 @@ func ConvertMessages(
 		prompt = prompt[loc[0]:]
 	}
 
-	// 在本地文件路径后追加提示
-	prompt = localFilePathRE.ReplaceAllStringFunc(prompt, func(s string) string {
-		return s + LocalFileHint
-	})
+	// 在本地文件路径后追加提示（跳过已带提示的路径，与 Python 负向后顾断言一致）
+	prompt = appendLocalFileHints(prompt)
 
 	return []map[string]any{
 		{
@@ -440,7 +468,7 @@ func NewGLMEventAccumulator(model string, allowedToolNames map[string]bool, fall
 	if logger == nil {
 		logger = logging.GetLogger("glm2api.null")
 	}
-	return &GLMEventAccumulator{
+	acc := &GLMEventAccumulator{
 		Model:                 model,
 		AllowedToolNames:      allowedToolNames,
 		FallbackToolURL:       fallbackToolURL,
@@ -457,6 +485,9 @@ func NewGLMEventAccumulator(model string, allowedToolNames map[string]bool, fall
 		blockedToolCallIDs:    map[string]bool{},
 		renderCacheDirty:      true,
 	}
+	// 与 Python __post_init__ 一致：将 allowed_tool_names 同步到流式工具解析器
+	acc.toolParser.AllowedToolNames = allowedToolNames
+	return acc
 }
 
 // insertSorted 将 logic_id 有序插入
@@ -477,6 +508,11 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 		if id, ok := payload["conversation_id"].(string); ok && id != "" {
 			a.ConversationID = id
 		}
+	}
+
+	// 工具调用已解析完成，后续事件不再处理（与 Python 的 is_tool_call_completed 一致）
+	if a.toolParser.IsToolCallCompleted() {
+		return nil, "tool_call_complete"
 	}
 
 	// 处理 parts
