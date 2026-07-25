@@ -185,51 +185,6 @@ func NewClient(cfg *config.AppConfig, logger *slog.Logger) *Client {
 	}
 }
 
-// ChatCompletion 非流式聊天补全
-func (c *Client) ChatCompletion(ctx context.Context, payload map[string]any) (map[string]any, string, error) {
-	_, allowedToolNames := c.resolveTools(payload)
-	lease, err := c.RequestQueue.Acquire(fmt.Sprintf("chat:%v", payload["model"]))
-	if err != nil {
-		return nil, "", err
-	}
-
-	response, assistantID, err := c.openChatStream(ctx, payload, c.getPreferredAccountIndex(lease.ticket))
-	if err != nil {
-		lease.Release()
-		return nil, "", err
-	}
-
-	accumulator := translator.NewGLMEventAccumulator(
-		fmt.Sprintf("%v", payload["model"]),
-		allowedToolNames,
-		translator.ExtractRecentUserURL(getMessagesList(payload)),
-		c.config.DebugDumpAll,
-		c.logger,
-	)
-
-	defer func() {
-		response.Body.Close()
-		c.DeleteConversation(ctx, accumulator.ConversationID, assistantID)
-		lease.Release()
-	}()
-
-	events := c.iterSSEEvents(response.Body)
-	for event := range events {
-		if event == nil {
-			continue
-		}
-		if err := c.raiseForEventError(event, false); err != nil {
-			return nil, "", err
-		}
-		accumulator.ConsumeEvent(event)
-		status, _ := event["status"].(string)
-		if status == "finish" || status == "intervene" {
-			return accumulator.BuildResponse(), accumulator.ConversationID, nil
-		}
-	}
-	return accumulator.BuildResponse(), accumulator.ConversationID, nil
-}
-
 // StreamChatCompletion 流式聊天补全
 // 返回一个 channel，持续输出 SSE chunks ([]byte)
 func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]any) (<-chan []byte, error) {

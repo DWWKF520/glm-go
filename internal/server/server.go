@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"glm2api/internal/adapters"
 	"glm2api/internal/config"
 	"glm2api/internal/glmclient"
 	"glm2api/internal/logging"
@@ -20,11 +18,11 @@ import (
 
 // Server HTTP 服务器
 type Server struct {
-	config  *config.AppConfig
-	logger  *slog.Logger
-	client  *glmclient.Client
-	router  *gin.Engine
-	srv     *http.Server
+	config *config.AppConfig
+	logger *slog.Logger
+	client *glmclient.Client
+	router *gin.Engine
+	srv    *http.Server
 }
 
 // NewServer 创建服务器
@@ -60,8 +58,6 @@ func (s *Server) setupRouter() {
 		v1.GET("/models", s.handleListModels)
 		v1.POST("/chat/completions", s.handleChatCompletions)
 		v1.POST("/images/generations", s.handleImagesGenerations)
-		v1.POST("/messages", s.handleAnthropicMessages)
-		v1.POST("/responses", s.handleResponses)
 	}
 
 	s.router = r
@@ -112,7 +108,7 @@ func (s *Server) corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", origin)
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Api-Key, anthropic-version, anthropic-beta")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Api-Key")
 		c.Header("Access-Control-Max-Age", "86400")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
@@ -205,11 +201,9 @@ func (s *Server) handleRoot(c *gin.Context) {
 		"name":    "glm2api",
 		"version": "1.0.0",
 		"endpoints": gin.H{
-			"chat":      s.config.APIPrefix + "/chat/completions",
-			"models":    s.config.APIPrefix + "/models",
-			"images":    s.config.APIPrefix + "/images/generations",
-			"messages":  s.config.APIPrefix + "/messages",
-			"responses": s.config.APIPrefix + "/responses",
+			"chat":   s.config.APIPrefix + "/chat/completions",
+			"models": s.config.APIPrefix + "/models",
+			"images": s.config.APIPrefix + "/images/generations",
 		},
 	})
 }
@@ -247,26 +241,7 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 		return
 	}
 
-	stream := false
-	if s, ok := payload["stream"].(bool); ok {
-		stream = s
-	}
-
-	if stream {
-		s.handleChatCompletionsStream(c, payload)
-		return
-	}
-	s.handleChatCompletionsNonStream(c, payload)
-}
-
-func (s *Server) handleChatCompletionsNonStream(c *gin.Context, payload map[string]any) {
-	ctx := c.Request.Context()
-	response, _, err := s.client.ChatCompletion(ctx, payload)
-	if err != nil {
-		s.writeError(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, response)
+	s.handleChatCompletionsStream(c, payload)
 }
 
 func (s *Server) handleChatCompletionsStream(c *gin.Context, payload map[string]any) {
@@ -323,150 +298,6 @@ func (s *Server) handleImagesGenerations(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-func (s *Server) handleAnthropicMessages(c *gin.Context) {
-	var payload map[string]any
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{
-				"message": "请求体解析失败: " + err.Error(),
-				"type":    "invalid_request_error",
-			},
-		})
-		return
-	}
-
-	openaiPayload := adapters.AnthropicToOpenAI(payload)
-	stream := false
-	if s, ok := openaiPayload["stream"].(bool); ok {
-		stream = s
-	}
-
-	model, _ := payload["model"].(string)
-	if model == "" {
-		model = "glm-4"
-	}
-
-	if stream {
-		s.handleAnthropicStream(c, openaiPayload, model)
-		return
-	}
-
-	ctx := c.Request.Context()
-	response, _, err := s.client.ChatCompletion(ctx, openaiPayload)
-	if err != nil {
-		s.writeError(c, err)
-		return
-	}
-	anthropicResp := adapters.OpenAIToAnthropicResponse(response, model)
-	c.JSON(http.StatusOK, anthropicResp)
-}
-
-func (s *Server) handleAnthropicStream(c *gin.Context, openaiPayload map[string]any, model string) {
-	ctx := c.Request.Context()
-	ch, err := s.client.StreamChatCompletion(ctx, openaiPayload)
-	if err != nil {
-		s.writeError(c, err)
-		return
-	}
-
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-
-	accumulator := adapters.NewAnthropicStreamAccumulator(model)
-	flusher := c.Writer.(interface{ Flush() })
-
-	clientGone := ctx.Done()
-	for {
-		select {
-		case <-clientGone:
-			return
-		case chunk, ok := <-ch:
-			if !ok {
-				return
-			}
-			events := accumulator.FeedChunk(chunk)
-			for _, event := range events {
-				_, _ = c.Writer.Write([]byte(event))
-			}
-			flusher.Flush()
-		}
-	}
-}
-
-func (s *Server) handleResponses(c *gin.Context) {
-	var payload map[string]any
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{
-				"message": "请求体解析失败: " + err.Error(),
-				"type":    "invalid_request_error",
-			},
-		})
-		return
-	}
-
-	openaiPayload := adapters.ResponsesToOpenAI(payload)
-	stream := false
-	if s, ok := openaiPayload["stream"].(bool); ok {
-		stream = s
-	}
-
-	model, _ := payload["model"].(string)
-	if model == "" {
-		model = "glm-4"
-	}
-
-	if stream {
-		s.handleResponsesStream(c, openaiPayload, model)
-		return
-	}
-
-	ctx := c.Request.Context()
-	response, _, err := s.client.ChatCompletion(ctx, openaiPayload)
-	if err != nil {
-		s.writeError(c, err)
-		return
-	}
-	responsesResp := adapters.OpenAIToResponsesResponse(response, model)
-	c.JSON(http.StatusOK, responsesResp)
-}
-
-func (s *Server) handleResponsesStream(c *gin.Context, openaiPayload map[string]any, model string) {
-	ctx := c.Request.Context()
-	ch, err := s.client.StreamChatCompletion(ctx, openaiPayload)
-	if err != nil {
-		s.writeError(c, err)
-		return
-	}
-
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-
-	accumulator := adapters.NewResponsesStreamAccumulator(model)
-	flusher := c.Writer.(interface{ Flush() })
-
-	clientGone := ctx.Done()
-	for {
-		select {
-		case <-clientGone:
-			return
-		case chunk, ok := <-ch:
-			if !ok {
-				return
-			}
-			events := accumulator.FeedChunk(chunk)
-			for _, event := range events {
-				_, _ = c.Writer.Write([]byte(event))
-			}
-			flusher.Flush()
-		}
-	}
-}
-
 // writeError 写入错误响应
 func (s *Server) writeError(c *gin.Context, err error) {
 	status := http.StatusInternalServerError
@@ -495,5 +326,4 @@ func (s *Server) writeError(c *gin.Context, err error) {
 	c.JSON(status, payload)
 }
 
-// 用于消除未使用导入
-var _ = json.Marshal
+
