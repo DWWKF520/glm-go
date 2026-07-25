@@ -16,6 +16,10 @@ var (
 	ToolCodeFencePattern = regexp.MustCompile("(?is)```tool_code[ \t]*\n(?P<body>[\\s\\S]*?)\n?```")
 	// ToolResultFencePattern 匹配完整的 ```tool_result ... ``` 块
 	ToolResultFencePattern = regexp.MustCompile("(?is)```tool_result[ \t]*\n[\\s\\S]*?\n?```")
+	// FunctionCallsFencePattern 匹配 [function_calls]...[/function_calls] 块
+	FunctionCallsFencePattern = regexp.MustCompile(`(?is)\[function_calls\](?P<body>[\s\S]*?)(?:\[/function_calls\]|$)`)
+	// CallItemStartPattern 匹配 [call:name] 项目起始
+	CallItemStartPattern = regexp.MustCompile(`(?i)\[call\s*[:=]?\s*(?P<name>[a-zA-Z0-9_:-]+)\]`)
 	// ToolCodeStartPattern 流式检测起始标记
 	ToolCodeStartPattern = regexp.MustCompile("(?i)```tool_code[ \t]*\n")
 	// ToolResultStartPattern 流式检测起始标记
@@ -25,8 +29,8 @@ var (
 	// 裸 JSON 工具调用开始
 	BareToolCallsOpenPattern = regexp.MustCompile(`(?i)\{\s*"tool_calls"\s*:`)
 
-	toolCodeMarker   = "```tool_code"
-	toolResultMarker = "```tool_result"
+	toolCodeMarker    = "```tool_code"
+	toolResultMarker  = "```tool_result"
 	fenceCloseNewline = "\n```"
 	fenceCloseBare    = "```"
 )
@@ -179,6 +183,55 @@ func ExtractFirstJSONObject(text string, start int) (string, [2]int) {
 	return "", [2]int{-1, -1}
 }
 
+// ExtractCallArgsBalanced 从 [call:name]...[/call] 项中提取平衡的 JSON 参数
+// 返回 (argsJSON, endPosition)，找不到返回 ("", -1)
+func ExtractCallArgsBalanced(text string) (string, int) {
+	pos := indexFrom(text, "{", 0)
+	if pos == -1 {
+		return "", -1
+	}
+	depth := 0
+	inString := false
+	escape := false
+	for i := pos; i < len(text); i++ {
+		c := text[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if c == '\\' {
+			escape = true
+			continue
+		}
+		if c == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if c == '{' {
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 {
+				return text[pos : i+1], i + 1
+			}
+		}
+	}
+	return "", -1
+}
+
+// FixCommonJsonErrors 修复常见的 JSON 错误
+func FixCommonJsonErrors(text string) string {
+	if text == "" {
+		return text
+	}
+	// 移除 } 或 ] 前的尾随逗号
+	fixed := trailingCommaRE.ReplaceAllString(text, "$1")
+	return fixed
+}
+
 // RemoveSpans 从文本中移除指定范围，并清理结果
 func RemoveSpans(text string, spans [][2]int, trimOuterWhitespace bool) string {
 	if len(spans) == 0 {
@@ -221,12 +274,77 @@ func RemoveSpans(text string, spans [][2]int, trimOuterWhitespace bool) string {
 
 var multiNewlineRE = regexp.MustCompile(`\n{3,}`)
 
-// ExtractFencedBlocks 从 ```tool_code 块中提取工具调用
+// ExtractFencedBlocks 从 [function_calls] 和 ```tool_code 块中提取工具调用
 // 返回 (spans, toolCalls)
 func ExtractFencedBlocks(text string, allowedToolNames map[string]bool) ([][2]int, []map[string]any) {
 	var spans [][2]int
 	var toolCalls []map[string]any
 
+	// 首先尝试解析 [function_calls]...[/function_calls] 块
+	fcMatches := FunctionCallsFencePattern.FindAllStringSubmatchIndex(text, -1)
+	for _, m := range fcMatches {
+		bodyStart, bodyEnd := m[2], m[3]
+		body := text[bodyStart:bodyEnd]
+
+		cursor := 0
+		for cursor < len(body) {
+			callStart := CallItemStartPattern.FindAllStringSubmatchIndex(body[cursor:], 1)
+			if callStart == nil {
+				break
+			}
+			// callStart[0][2]=name起始, callStart[0][3]=name结束
+			nameStart := cursor + callStart[0][2]
+			nameEnd := cursor + callStart[0][3]
+			name := strings.TrimSpace(body[nameStart:nameEnd])
+			argsStartPos := cursor + callStart[0][1]
+
+			argsStr, argsEnd := ExtractCallArgsBalanced(body[argsStartPos:])
+			if argsStr == "" {
+				// 没有找到 JSON，尝试找 [/call] 作为回退
+				closeTag := strings.Index(body[argsStartPos:], "[/call]")
+				if closeTag == -1 {
+					break
+				}
+				cursor = argsStartPos + closeTag + len("[/call]")
+				continue
+			}
+
+			if name == "" || !IsAllowedToolName(name, allowedToolNames) {
+				cursor = argsStartPos + argsEnd
+				continue
+			}
+
+			argsDict := TryParseJSON(argsStr)
+			if argsDict == nil {
+				fixedArgs := FixCommonJsonErrors(argsStr)
+				argsDict = TryParseJSON(fixedArgs)
+			}
+			if argsDict == nil {
+				argsDict = map[string]any{}
+			}
+			argsMap, ok := argsDict.(map[string]any)
+			if !ok {
+				argsMap = map[string]any{"value": argsDict}
+			}
+
+			tc := BuildToolCall(name, argsMap, len(toolCalls))
+			toolCalls = append(toolCalls, tc)
+
+			// 查找 [/call] 结束标签
+			endPos := argsStartPos + argsEnd
+			closeTagIdx := strings.Index(body[endPos:], "[/call]")
+			if closeTagIdx != -1 {
+				cursor = endPos + closeTagIdx + len("[/call]")
+			} else {
+				cursor = endPos
+			}
+		}
+
+		// 始终消费整个 fence
+		spans = append(spans, [2]int{m[0], m[1]})
+	}
+
+	// 然后解析 ```tool_code 块（旧格式支持）
 	matches := ToolCodeFencePattern.FindAllStringSubmatchIndex(text, -1)
 	for _, m := range matches {
 		// m[0]=整体起始, m[1]=整体结束, m[2]=body起始, m[3]=body结束
@@ -361,8 +479,30 @@ func ParseToolCallsFromText(text string, allowedToolNames map[string]bool) (stri
 			toolParserLogger.Debug("parse_tool_calls_from_text: bare-JSON fallback recovered tool calls", "count", len(bareCalls), "text_len", len(text))
 			return RemoveSpans(text, bareSpans, true), bareCalls
 		}
+
+		// 仅当文本看起来像是要发出工具调用时才发出警告
+		lowered := strings.ToLower(text)
+		looksTooly := strings.Contains(lowered, "tool_calls") ||
+			strings.Contains(lowered, "tool_code") ||
+			strings.Contains(lowered, "tool_result") ||
+			strings.Contains(lowered, "```tool") ||
+			BareToolCallsOpenPattern.MatchString(text)
+		if looksTooly {
+			toolParserLogger.Warn("parse_tool_calls_from_text: tool-like marker found but no tool calls parsed",
+				"text_len", len(text), "text_start", truncateForLog(text, 80))
+		} else {
+			toolParserLogger.Debug("parse_tool_calls_from_text: no tool calls found (non-tool content)", "text_len", len(text))
+		}
 	}
 	return RemoveSpans(text, spans, true), toolCalls
+}
+
+// truncateForLog 截断文本用于日志
+func truncateForLog(text string, maxLen int) string {
+	if len(text) <= maxLen {
+		return text
+	}
+	return text[:maxLen]
 }
 
 // FindPartialMarker 返回文本尾部部分 ```tool_code / ```tool_result 标记的起始位置
@@ -391,6 +531,7 @@ type StreamingToolParser struct {
 	PendingText       string
 	ToolCalls         []map[string]any
 	AllowedToolNames  map[string]bool
+	_toolCallCompleted bool
 }
 
 // NewStreamingToolParser 创建流式工具调用解析器
@@ -403,23 +544,36 @@ func (p *StreamingToolParser) Consume(chunk string) string {
 	if chunk == "" {
 		return ""
 	}
+	if p._toolCallCompleted {
+		return ""
+	}
 	p.PendingText += chunk
 	visible, remainder, parsedCalls := SplitStreamText(p.PendingText, p.AllowedToolNames, false)
 	p.PendingText = remainder
 	p.ToolCalls = append(p.ToolCalls, parsedCalls...)
+	if len(parsedCalls) > 0 {
+		p._toolCallCompleted = true
+	}
 	return visible
 }
 
 // Flush 刷新剩余文本，返回 (可见文本, 工具调用列表)
 func (p *StreamingToolParser) Flush() (string, []map[string]any) {
+	if p._toolCallCompleted {
+		return "", p.ToolCalls
+	}
 	visible, remainder, parsedCalls := SplitStreamText(p.PendingText, p.AllowedToolNames, true)
 	p.ToolCalls = append(p.ToolCalls, parsedCalls...)
+	if len(parsedCalls) > 0 {
+		p._toolCallCompleted = true
+	}
 
 	tail := ""
-	if remainder != "" {
+	if remainder != "" && !p._toolCallCompleted {
 		salvaged := SalvageIncompleteBlock(remainder, p.AllowedToolNames, p.ToolCalls)
 		if salvaged != nil {
 			p.PendingText = ""
+			p._toolCallCompleted = true
 		} else {
 			tail = remainder
 			p.PendingText = ""
@@ -428,6 +582,11 @@ func (p *StreamingToolParser) Flush() (string, []map[string]any) {
 		p.PendingText = ""
 	}
 	return strings.TrimSpace(visible + tail), p.ToolCalls
+}
+
+// IsToolCallCompleted 返回工具调用是否已完成
+func (p *StreamingToolParser) IsToolCallCompleted() bool {
+	return p._toolCallCompleted
 }
 
 // SplitStreamText 将文本拆分为 (可见文本, 剩余文本, 工具调用)

@@ -26,9 +26,9 @@ var BlockedNativeToolNames = map[string]bool{
 var ServerSideToolNames = map[string]bool{}
 
 // CanonicalToolCallExample 工具调用示例
-const CanonicalToolCallExample = "```tool_code\n" +
-	`{"tool_calls":[{"name":"TOOL_NAME","arguments":{"actual_parameter_name":"value"}}]}` + "\n" +
-	"```"
+const CanonicalToolCallExample = "[function_calls]\n" +
+	`[call:TOOL_NAME]{"actual_parameter_name":"value"}[/call]` + "\n" +
+	"[/function_calls]"
 
 // SafeJSONDumps 安全 JSON 序列化（不转义 HTML）
 func SafeJSONDumps(v any) string {
@@ -122,12 +122,8 @@ func NormalizeArguments(payload any) map[string]any {
 // SerializeToolCallBlock 序列化工具调用块
 func SerializeToolCallBlock(name string, arguments any) string {
 	normalized := NormalizeArguments(arguments)
-	payload := map[string]any{
-		"tool_calls": []map[string]any{
-			{"name": name, "arguments": normalized},
-		},
-	}
-	return "```tool_code\n" + SafeJSONDumpsCompact(payload) + "\n```"
+	argsJSON := SafeJSONDumpsCompact(normalized)
+	return "[function_calls]\n[call:" + name + "]" + argsJSON + "[/call]\n[/function_calls]"
 }
 
 // SerializeToolResultBlock 序列化工具结果块
@@ -232,7 +228,7 @@ func BuildToolCallInstructions(toolNames []string, serverSideToolNames map[strin
 
 	lines := []string{
 		"# TOOL USE PROTOCOL",
-		"You are an AI assistant with access to the tools listed above. When you need to use a tool, you MUST output a JSON block — NOT prose narration, NOT XML/DSML tags.",
+		"You are an AI assistant with access to the tools listed above. When you need to use a tool, you MUST output a function_calls block — NOT prose narration, NOT XML/DSML tags.",
 		"",
 		"## Core Rules",
 		"1. Only use tools explicitly listed in the schemas above. Never invent tool names.",
@@ -245,9 +241,9 @@ func BuildToolCallInstructions(toolNames []string, serverSideToolNames map[strin
 		lines = append(lines, "",
 			"## Server-side Tools",
 			"Server-side tools (auto-executed by backend): "+availableServerNames+".",
-			"Output a single JSON block wrapped in a ```tool_code fence: "+
-				`{"tool_calls":[{"name":"TOOL_NAME","arguments":"<JSON_STRING>"}]}`,
-			"The `arguments` field can be a JSON object directly. Do not wrap server-side calls in any other format.",
+			"Output a function_calls block wrapped in [function_calls] tags: "+
+				`[function_calls][call:TOOL_NAME]{"parameter":"value"}[/call][/function_calls]`,
+			"The arguments field should be a JSON object directly. Do not wrap server-side calls in any other format.",
 		)
 	}
 
@@ -258,31 +254,30 @@ func BuildToolCallInstructions(toolNames []string, serverSideToolNames map[strin
 			"Use their EXACT names and parameter fields from the schemas — never rename or guess parameters.",
 			"",
 			"### When to Call a JSON Tool",
-			"Output ONE ```tool_code fenced JSON block. Do NOT add any prose, explanation, apology, or progress text before or after the block.",
+			"Output ONE [function_calls] block. Do NOT add any prose, explanation, apology, or progress text before or after the block.",
 			"The block MUST be the complete content of your response — nothing else in the same turn.",
 			"",
-			"### JSON Format",
+			"### function_calls Format",
 			CanonicalToolCallExample,
 			"",
-			"### JSON Syntax Rules",
-			"- Wrap the JSON payload in a ```tool_code fenced code block.",
-			`- Root object: `+`{"tool_calls":[...]}`+` containing one or more call objects.`,
-			`- Each call: `+`{"name":"tool_name","arguments":{...}}`+`.`,
+			"### Syntax Rules",
+			"- Wrap the tool call in [function_calls]...[/function_calls] tags.",
+			`- Each call: [call:tool_name]{"parameter":"value"}[/call].`,
 			"- Parameter names are case-sensitive and must exactly match the schema (e.g. `filePath` not `filepath`).",
-			"- Nested objects and arrays: write them directly as JSON values inside `arguments`.",
-			"- Strings: use JSON string escaping (e.g. `\\n`, `\\\"`, `\\\\`). Do NOT wrap strings in CDATA.",
-			"- Multiple calls in one turn: put multiple objects in the `tool_calls` array.",
+			"- Nested objects and arrays: write them directly as JSON values.",
+			"- Strings: use JSON string escaping (e.g. `\\\\n`, `\\\\\"`, `\\\\\\\\`). Do NOT wrap strings in CDATA.",
+			"- Multiple calls in one turn: put multiple [call:...]...[/call] blocks inside the same [function_calls] block.",
 			"- CRITICAL: The JSON must be valid. Close every `{` and `[` with matching `}` and `]`.",
-			"- CRITICAL: After the closing ``` fence, do NOT output any additional text in the same response.",
+			"- CRITICAL: After the closing [/function_calls] tag, do NOT output any additional text in the same response.",
 		)
 	}
 
 	lines = append(lines, "",
 		"## General Rules",
 		"- If a URL/search/browse action is needed but no such tool is listed, tell the user no such tool is available.",
-		"- After receiving a ```tool_result block, answer the user directly from the result. Do not repeat the tool-call decision process.",
-		"- Never emit XML/DSML tags, function_call objects, or any non-JSON syntax for tool calls.",
-		"- Do not mix explanation text with the JSON tool block in the same response.",
+		"- After receiving a tool result, answer the user directly from the result. Do not repeat the tool-call decision process.",
+		"- Never emit XML/DSML tags, JSON tool_calls objects, or any non-function_calls syntax for tool calls.",
+		"- Do not mix explanation text with the function_calls block in the same response.",
 	)
 
 	switch mode {
