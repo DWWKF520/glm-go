@@ -46,7 +46,6 @@ func main() {
 		"guest_mode", cfg.GLMUseGuestRefreshToken,
 		"account_count", len(cfg.GLMRefreshTokens),
 		"max_concurrency", cfg.GLMMaxConcurrency,
-		"exposed_models", len(cfg.ExposedModels),
 	)
 
 	// 创建 GLM 客户端

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -39,8 +40,21 @@ func SetupLogging(level, logFile string) {
 
 	var handler slog.Handler = NewTUIHandler(os.Stdout, lvl)
 	if logFile != "" {
-		if err := os.MkdirAll(filepath.Dir(logFile), 0755); err == nil {
-			if f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		// 每次启动生成带时间戳的新日志文件
+		dir := filepath.Dir(logFile)
+		ext := filepath.Ext(logFile)
+		base := strings.TrimSuffix(filepath.Base(logFile), ext)
+		if dir == "" {
+			dir = "."
+		}
+		if ext == "" {
+			ext = ".log"
+		}
+		ts := time.Now().Format("20060102_150405")
+		logFilePath := filepath.Join(dir, base+"_"+ts+ext)
+
+		if err := os.MkdirAll(dir, 0755); err == nil {
+			if f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
 				handler = NewMultiHandler(os.Stdout, f, lvl)
 			}
 		}
