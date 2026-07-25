@@ -346,7 +346,7 @@ func (c *Client) DeleteConversation(ctx context.Context, conversationID, assista
 	}
 	status := getAny(payload, "status")
 	code := getAny(payload, "code")
-	if (status != nil && status != 0) || (code != nil && code != 0) {
+	if (status != nil && fmt.Sprintf("%v", status) != "0") || (code != nil && fmt.Sprintf("%v", code) != "0") {
 		c.logger.Warn("GLM 会话删除返回非成功状态", "conversation_id", conversationID, "assistant_id", actualAssistantID, "payload", payload)
 		return
 	}
@@ -1234,7 +1234,7 @@ func (c *Client) extractEventError(event map[string]any) map[string]any {
 		}
 		partStatus, _ := part["status"].(string)
 		if strings.ToLower(strings.TrimSpace(partStatus)) == "error" {
-			return map[string]any{"message": "GLM part status error"}
+			return map[string]any{"message": "GLM part status error", "part": part}
 		}
 	}
 	return nil

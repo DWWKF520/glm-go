@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
-	"github.com/bytedance/sonic"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bytedance/sonic"
+
 	"github.com/google/uuid"
 
 	"glm2api/internal/config"
@@ -23,7 +24,7 @@ import (
 )
 
 const (
-	SignSecret              = "8a1317a7468aa3ad86e997d08f3f31cb"
+	SignSecret             = "8a1317a7468aa3ad86e997d08f3f31cb"
 	AccessTokenExpiresSecs = 3600
 )
 
@@ -269,7 +270,7 @@ func (m *Manager) getAccessTokenForIndex(index int) (string, error) {
 	}
 	account := m.accounts[index]
 	if account.CachedToken != nil && time.Now().Unix() < int64(account.CachedToken.ExpiresAt)-60 {
-		m.logger.Debug("使用缓存 access_token", "account", index, "剩余秒", int(account.CachedToken.ExpiresAt-float64(time.Now().Unix())))
+		//m.logger.Debug("使用缓存 access_token", "account", index, "剩余秒", int(account.CachedToken.ExpiresAt-float64(time.Now().Unix())))
 		return account.CachedToken.AccessToken, nil
 	}
 	token, err := m.refreshAccessToken(index)
