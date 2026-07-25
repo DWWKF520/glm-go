@@ -229,15 +229,16 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 					c.logger.Warn("GLM 流式事件包含错误 part，已过滤", "error", err, "filtered_parts", len(cleaned))
 					event["parts"] = cleaned
 				} else {
-					out <- []byte(formatErrorChunk(err))
-					return
+					// 所有 part 均有错误，跳过此事件继续处理下一个，避免单个 part 错误中断整个流
+					c.logger.Warn("GLM 流式事件所有 part 均有错误，跳过此事件", "error", err)
+					continue
 				}
 			}
 			chunks, status := accumulator.ConsumeEvent(event)
 			for _, chunk := range chunks {
 				out <- []byte(chunk)
 			}
-			if status == "finish" || status == "intervene" {
+			if status == "finish" || status == "intervene" || status == "tool_call_complete" {
 				lastError, _ := event["last_error"].(map[string]any)
 				for _, chunk := range accumulator.Finalize(status, lastError) {
 					out <- []byte(chunk)
@@ -397,16 +398,20 @@ func (c *Client) resolveTools(openaiPayload map[string]any) ([]map[string]any, m
 		}
 	}
 
-	allowedToolNames := map[string]bool{}
-	for _, t := range filteredTools {
-		fn, _ := t["function"].(map[string]any)
-		if fn == nil {
-			continue
-		}
-		name, _ := fn["name"].(string)
-		name = strings.TrimSpace(name)
-		if name != "" {
-			allowedToolNames[name] = true
+	// 与 Python 一致：无工具时返回 nil（表示不限制工具名），而非空 map（表示禁止所有工具）
+	var allowedToolNames map[string]bool
+	if len(filteredTools) > 0 {
+		allowedToolNames = map[string]bool{}
+		for _, t := range filteredTools {
+			fn, _ := t["function"].(map[string]any)
+			if fn == nil {
+				continue
+			}
+			name, _ := fn["name"].(string)
+			name = strings.TrimSpace(name)
+			if name != "" {
+				allowedToolNames[name] = true
+			}
 		}
 	}
 	return filteredTools, allowedToolNames
@@ -1404,17 +1409,6 @@ func coercePositiveInt(value any, defaultValue, maximum int) int {
 	default:
 		return defaultValue
 	}
-}
-
-func formatErrorChunk(err error) string {
-	errPayload := map[string]any{
-		"error": map[string]any{
-			"message": err.Error(),
-			"type":    "upstream_error",
-		},
-	}
-	data, _ := sonic.Marshal(errPayload)
-	return "data: " + string(data) + "\n\n"
 }
 
 // 用于消除未使用导入的告警
