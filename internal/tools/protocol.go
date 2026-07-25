@@ -32,21 +32,20 @@ const CanonicalToolCallExample = "[function_calls]\n" +
 
 // SafeJSONDumps 安全 JSON 序列化（不转义 HTML）
 func SafeJSONDumps(v any) string {
-	data, err := sonic.Marshal(v)
+	data, err := sonic.MarshalString(v)
 	if err != nil {
 		return "{}"
 	}
-	// 确保非 ASCII 字符不被转义
-	return string(data)
+	return data
 }
 
 // SafeJSONDumpsCompact 紧凑 JSON 序列化
 func SafeJSONDumpsCompact(v any) string {
-	data, err := sonic.Marshal(v)
+	data, err := sonic.MarshalString(v)
 	if err != nil {
 		return "{}"
 	}
-	return string(data)
+	return data
 }
 
 // NormalizeToolName 规范化工具名
@@ -100,7 +99,7 @@ func NormalizeArguments(payload any) map[string]any {
 			return map[string]any{}
 		}
 		var v any
-		if err := sonic.Unmarshal([]byte(s), &v); err != nil {
+		if err := sonic.UnmarshalString(s, &v); err != nil {
 			return map[string]any{"raw": s}
 		}
 		parsed = v

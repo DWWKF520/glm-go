@@ -86,14 +86,14 @@ func IsAllowedToolName(toolName string, allowedToolNames map[string]bool) bool {
 
 // BuildToolCall 构建工具调用对象
 func BuildToolCall(name string, arguments map[string]any, index int) map[string]any {
-	argsBytes, _ := sonic.Marshal(arguments)
+	argsBytes, _ := sonic.MarshalString(arguments)
 	return map[string]any{
 		"id":    "call_" + uuid.New().String()[:24],
 		"type":  "function",
 		"index": index,
 		"function": map[string]any{
 			"name":      name,
-			"arguments": string(argsBytes),
+			"arguments": argsBytes,
 		},
 	}
 }
@@ -131,12 +131,12 @@ func TryParseJSON(text string) any {
 		return nil
 	}
 	var v any
-	if err := sonic.Unmarshal([]byte(stripped), &v); err == nil {
+	if err := sonic.UnmarshalString(stripped, &v); err == nil {
 		return v
 	}
 	// 修复尾随逗号
 	repaired := trailingCommaRE.ReplaceAllString(stripped, "$1")
-	if err := sonic.Unmarshal([]byte(repaired), &v); err == nil {
+	if err := sonic.UnmarshalString(repaired, &v); err == nil {
 		return v
 	}
 	return nil

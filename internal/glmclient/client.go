@@ -856,7 +856,7 @@ func (c *Client) iterSSEEvents(body io.Reader) <-chan map[string]any {
 				return
 			}
 			var parsed map[string]any
-			if err := sonic.Unmarshal([]byte(payload), &parsed); err != nil {
+			if err := sonic.UnmarshalString(payload, &parsed); err != nil {
 				c.logger.Debug("忽略无法解析的 SSE 片段", "payload", payload)
 				return
 			}

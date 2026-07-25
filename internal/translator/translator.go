@@ -118,7 +118,7 @@ func SanitizeToolCallPayload(toolName string, arguments any, fallbackURL string)
 	parsedArguments := arguments
 	if s, ok := arguments.(string); ok {
 		var v any
-		if err := sonic.Unmarshal([]byte(s), &v); err == nil {
+		if err := sonic.UnmarshalString(s, &v); err == nil {
 			parsedArguments = v
 		} else {
 			return nil
@@ -175,7 +175,7 @@ func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string) []map[str
 		originalValue := originalArguments
 		if s, ok := originalArguments.(string); ok {
 			var v any
-			if err := sonic.Unmarshal([]byte(s), &v); err == nil {
+			if err := sonic.UnmarshalString(s, &v); err == nil {
 				originalValue = v
 			} else {
 				originalValue = s
@@ -1047,7 +1047,11 @@ func (a *GLMEventAccumulator) chunkJSON(patch map[string]any) string {
 	for k, v := range patch {
 		payload[k] = v
 	}
-	return "data: " + tools.SafeJSONDumpsCompact(payload) + "\n\n"
+	jsonStr, err := sonic.MarshalString(payload)
+	if err != nil {
+		return "data: {}\n\n"
+	}
+	return "data: " + jsonStr + "\n\n"
 }
 
 func containsString(s []string, v string) bool {
