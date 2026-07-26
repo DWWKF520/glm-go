@@ -82,9 +82,9 @@ func (e *QueueTimeoutError) Error() string { return e.msg }
 // QueueLease 队列租约，代表一个请求占用了队列中的一个执行槽位
 // 使用租约模式确保请求完成后正确释放槽位
 type QueueLease struct {
-	ticket          int             // 分配的票据号（递增整数）
-	releaseCallback func(int)       // 释放时的回调函数
-	released        bool            // 是否已释放（防止重复释放）
+	ticket          int       // 分配的票据号（递增整数）
+	releaseCallback func(int) // 释放时的回调函数
+	released        bool      // 是否已释放（防止重复释放）
 }
 
 // Release 释放租约，将执行槽位归还给队列
@@ -105,13 +105,13 @@ func (l *QueueLease) Release() {
 //   - 请求完成后通过 release 释放槽位，servingTicket 前进
 //   - 超过 waitTimeout 仍未获得槽位的请求返回 QueueTimeoutError
 type ConcurrentRequestQueue struct {
-	logger          *slog.Logger       // 日志记录器
-	waitTimeout     time.Duration      // 最大等待超时时间
-	maxConcurrency  int                // 最大并发数（GLM 同时处理的对话数）
-	mu              *sync.Cond         // 条件变量，用于请求等待/唤醒
-	nextTicket      int                // 下一个将分配的票据号
-	servingTicket   int                // 当前正在服务的最小票据号
-	releasedTickets map[int]bool       // 已释放但尚未推进 servingTicket 的票据
+	logger          *slog.Logger  // 日志记录器
+	waitTimeout     time.Duration // 最大等待超时时间
+	maxConcurrency  int           // 最大并发数（GLM 同时处理的对话数）
+	mu              *sync.Cond    // 条件变量，用于请求等待/唤醒
+	nextTicket      int           // 下一个将分配的票据号
+	servingTicket   int           // 当前正在服务的最小票据号
+	releasedTickets map[int]bool  // 已释放但尚未推进 servingTicket 的票据
 }
 
 // NewConcurrentRequestQueue 创建并发请求队列
@@ -204,11 +204,11 @@ func (q *ConcurrentRequestQueue) release(ticket int) {
 // Client GLM Web 客户端
 // 封装了与 GLM Web API 交互的所有逻辑，包括认证、请求发送、响应解析、账号故障转移等
 type Client struct {
-	config       *config.AppConfig           // 应用配置
-	logger       *slog.Logger                // 日志记录器
-	Auth         *auth.Manager               // 认证管理器（管理多个账号的 access token）
-	RequestQueue *ConcurrentRequestQueue     // 并发请求队列
-	httpClient   *http.Client                // HTTP 客户端（带超时）
+	config       *config.AppConfig       // 应用配置
+	logger       *slog.Logger            // 日志记录器
+	Auth         *auth.Manager           // 认证管理器（管理多个账号的 access token）
+	RequestQueue *ConcurrentRequestQueue // 并发请求队列
+	httpClient   *http.Client            // HTTP 客户端（带超时）
 }
 
 // NewClient 创建 GLM 客户端
@@ -490,7 +490,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 		"messages":        convertedMessages,
 		"meta_data": map[string]any{
 			"channel":             "",
-			"chat_mode":           "thinking",  // 启用思考模式
+			"chat_mode":           "thinking", // 启用思考模式
 			"draft_id":            "",
 			"if_plus_model":       true,
 			"input_question_type": "xxxx",
@@ -905,7 +905,7 @@ func (c *Client) iterSSEEvents(body io.Reader) <-chan map[string]any {
 		scanner := bufio.NewScanner(body)
 		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024) // 增大缓冲区以处理大型事件
 		var pending strings.Builder
-
+		// 处理每个事件块
 		emitBlock := func(block string) {
 			block = strings.TrimSpace(block)
 			if block == "" {
@@ -1386,11 +1386,11 @@ type operationFunc func(accountIndex int, accessToken string) (any, error)
 // 当一个账号的请求失败时，自动切换到下一个账号重试
 //
 // 故障转移策略：
-//   1. 从首选账号（或当前账号）开始
-//   2. 如果获取 access token 失败且需要切换账号，则跳到下一个账号
-//   3. 如果操作执行失败且需要切换账号，则跳到下一个账号
-//   4. 游客账号支持额外的重试次数（GLMGuestMaxRetries）
-//   5. 所有账号都失败后，重置账号轮换状态并返回最后一个错误
+//  1. 从首选账号（或当前账号）开始
+//  2. 如果获取 access token 失败且需要切换账号，则跳到下一个账号
+//  3. 如果操作执行失败且需要切换账号，则跳到下一个账号
+//  4. 游客账号支持额外的重试次数（GLMGuestMaxRetries）
+//  5. 所有账号都失败后，重置账号轮换状态并返回最后一个错误
 func (c *Client) callWithAccountFailover(ctx context.Context, requestName string, operation operationFunc, preferredAccountIndex *int) (any, error) {
 	accountCount := c.Auth.GetAccountCount()
 	if accountCount <= 0 {

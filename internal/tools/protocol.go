@@ -9,15 +9,18 @@ import (
 	"github.com/bytedance/sonic"
 )
 
-// ServerSideToolNames 服务端工具名（空集合）
+// ServerSideToolNames 存储服务端工具名称的集合（目前为空集合）。
+// 用于区分客户端工具和服务端自动执行的工具，在构建提示词时会产生不同的调用指令。
 var ServerSideToolNames = map[string]bool{}
 
-// CanonicalToolCallExample 工具调用示例
+// CanonicalToolCallExample 是工具调用的标准格式示例，用于在提示词中展示给模型。
+// 格式为 [function_calls] 标签包裹多个 [call:TOOL_NAME]{...}[/call] 调用块。
 const CanonicalToolCallExample = "[function_calls]\n" +
 	`[call:TOOL_NAME_1]{"actual_parameter_name":"value"}[/call]` + "\n" + `[call:TOOL_NAME_2]{"actual_parameter_name":"value"}[/call]` + "\n" +
 	"[/function_calls]"
 
-// SafeJSONDumps 安全 JSON 序列化（不转义 HTML）
+// SafeJSONDumps 将任意值序列化为 JSON 字符串，使用 sonic 库且不转义 HTML 字符。
+// 序列化失败时返回空对象 "{}"。
 func SafeJSONDumps(v any) string {
 	data, err := sonic.MarshalString(v)
 	if err != nil {
@@ -26,7 +29,8 @@ func SafeJSONDumps(v any) string {
 	return data
 }
 
-// SafeJSONDumpsCompact 紧凑 JSON 序列化
+// SafeJSONDumpsCompact 将任意值序列化为紧凑的 JSON 字符串（无缩进、不转义 HTML）。
+// 序列化失败时返回空对象 "{}"。
 func SafeJSONDumpsCompact(v any) string {
 	data, err := sonic.MarshalString(v)
 	if err != nil {
@@ -35,13 +39,21 @@ func SafeJSONDumpsCompact(v any) string {
 	return data
 }
 
-// NormalizeToolName 规范化工具名
+// NormalizeToolName 将工具名称转换为规范化的字符串形式。
+// 对输入值调用 Sprintf 转为字符串后去除首尾空白。
+// 用于统一处理不同来源的工具名称（可能为 string、float64 等类型）。
 func NormalizeToolName(name any) string {
 	return strings.TrimSpace(fmt.Sprintf("%v", name))
 }
 
+// safeParamNameRE 匹配参数名中不允许的字符（非字母数字、下划线、点、冒号、连字符），
+// 用于 safeParameterName 将其替换为下划线
 var safeParamNameRE = regexp.MustCompile(`[^a-zA-Z0-9_.:-]`)
 
+// safeParameterName 将参数名规范化为安全的标识符格式。
+// 移除所有非字母数字、下划线、点、冒号、连字符的字符（替换为下划线）。
+// 如果结果为空，返回默认值 "value"。
+// 用于确保从 LLM 输出中提取的参数名不包含非法字符。
 func safeParameterName(value any) string {
 	s := strings.TrimSpace(fmt.Sprintf("%v", value))
 	s = safeParamNameRE.ReplaceAllString(s, "_")
@@ -51,7 +63,13 @@ func safeParameterName(value any) string {
 	return s
 }
 
-// NormalizeArguments 规范化工具参数
+// NormalizeArguments 将工具参数规范化为 map[string]any 格式。
+// 处理多种输入类型：
+// - string 类型：尝试 JSON 解析，失败则包装为 {"raw": 原文本}
+// - nil：返回空 map
+// - map 类型：对所有 key 调用 safeParameterName 规范化
+// - 其他类型：包装为 {"value": 原值}
+// 确保返回值始终为 map[string]any，方便后续序列化。
 func NormalizeArguments(payload any) map[string]any {
 	parsed := payload
 	if s, ok := parsed.(string); ok {
@@ -78,14 +96,20 @@ func NormalizeArguments(payload any) map[string]any {
 	return result
 }
 
-// SerializeToolCallBlock 序列化工具调用块
+// SerializeToolCallBlock 将工具调用序列化为 [function_calls] 格式的文本块。
+// 参数 name 是工具名称，arguments 是原始参数（会被 NormalizeArguments 规范化后序列化）。
+// 返回格式：[function_calls]\n[call:name]{"param":"value"}[/call]\n[/function_calls]
+// 用于在提示词中向模型展示工具调用的标准格式。
 func SerializeToolCallBlock(name string, arguments any) string {
 	normalized := NormalizeArguments(arguments)
 	argsJSON := SafeJSONDumpsCompact(normalized)
 	return "[function_calls]\n[call:" + name + "]" + argsJSON + "[/call]\n[/function_calls]"
 }
 
-// SerializeToolResultBlock 序列化工具结果块
+// SerializeToolResultBlock 将工具执行结果序列化为 ```tool_result 格式的文本块。
+// 参数 toolCallID 是对应的工具调用 ID，toolName 是工具名称，content 是执行结果文本。
+// 返回格式：```tool_result\n{"tool_result":{"call_id":"...","name":"...","content":"..."}}\n```
+// 用于在发送给 GLM API 的消息中包含工具执行结果。
 func SerializeToolResultBlock(toolCallID any, toolName, content string) string {
 	payload := map[string]any{
 		"tool_result": map[string]any{
@@ -97,13 +121,20 @@ func SerializeToolResultBlock(toolCallID any, toolName, content string) string {
 	return "```tool_result\n" + SafeJSONDumpsCompact(payload) + "\n```"
 }
 
-// ToolChoicePolicy 工具选择策略
+// ToolChoicePolicy 定义工具选择策略，控制模型是否应该使用工具以及使用哪个工具。
+// Mode 可选值："auto"（自动决定）、"none"（禁止使用）、"required"（必须使用）、"specific"（指定特定工具）
+// ToolName 仅在 Mode 为 "specific" 时有效，指定必须调用的工具名称。
 type ToolChoicePolicy struct {
 	Mode     string // "auto", "none", "required", "specific"
 	ToolName string
 }
 
-// ParseToolChoicePolicy 解析工具选择策略
+// ParseToolChoicePolicy 从 OpenAI 格式的 tool_choice 参数解析出工具选择策略。
+// 支持的输入格式：
+// - 字符串："auto"、"none"、"required"
+// - 对象：{"type":"function","function":{"name":"tool_name"}}
+// - nil：默认返回 "auto" 策略
+// availableToolNames 参数用于验证指定的工具名是否在可用工具列表中（传 nil 或空则跳过验证）。
 func ParseToolChoicePolicy(toolChoice any, availableToolNames map[string]bool) ToolChoicePolicy {
 	available := availableToolNames
 	if available == nil {
@@ -140,7 +171,10 @@ func ParseToolChoicePolicy(toolChoice any, availableToolNames map[string]bool) T
 	return ToolChoicePolicy{Mode: "auto"}
 }
 
-// BuildToolCallInstructions 构建工具调用指令
+// BuildToolCallInstructions 构建完整的工具调用协议指令文本，插入到系统提示词中。
+// 将工具分为两类：服务端工具（serverSideToolNames）和 JSON 工具，分别列出可用工具名。
+// 根据 policy.Mode 附加不同的约束指令（auto/none/required/specific）。
+// 返回的指令文本包含：工具调用核心规则、各类型工具的使用说明、格式示例、语法规则和通用规则。
 func BuildToolCallInstructions(toolNames []string, serverSideToolNames map[string]bool, policy ToolChoicePolicy) string {
 	serverSideSet := serverSideToolNames
 	if serverSideSet == nil {
@@ -262,7 +296,11 @@ func BuildToolCallInstructions(toolNames []string, serverSideToolNames map[strin
 	return strings.Join(lines, "\n")
 }
 
-// ToolsToPrompt 将工具列表转换为提示词
+// ToolsToPrompt 将 OpenAI 格式的工具列表转换为发送给 GLM API 的提示词文本。
+// 遍历每个工具，提取函数名、描述和参数 schema，生成 Markdown 格式的工具定义。
+// 然后调用 BuildToolCallInstructions 生成工具调用协议指令，拼接为完整的提示词。
+// 参数 policy 控制工具选择策略，serverSideToolNames 指定服务端工具集合。
+// 返回过滤掉空行后的完整提示词文本。
 func ToolsToPrompt(tools []map[string]any, policy ToolChoicePolicy, serverSideToolNames map[string]bool) string {
 	var toolNames []string
 	var toolSchemas []string

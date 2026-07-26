@@ -37,9 +37,11 @@ var (
 
 var toolParserLogger = slog.Default().With("logger", "glm2api.tool_parser")
 
-// FindFenceClose 查找最早的 ``` 闭合标记
-// 返回 (position, length)，length 为 4 表示 \n``` 形式，3 表示 ``` 形式
-// 找不到返回 (-1, 0)
+// FindFenceClose 从 text 的 start 位置开始，查找最早的 ``` 代码块闭合标记。
+// 返回两个值：闭合标记在原文中的起始位置，以及闭合标记的字节长度。
+// 长度为 4 表示 "\n```" 形式（换行+反引号），长度为 3 表示裸 "```" 形式。
+// 如果找不到任何闭合标记，返回 (-1, 0)。
+// 该函数优先匹配 "\n```" 形式，因为在实际文本中这种格式更规范。
 func FindFenceClose(text string, start int) (int, int) {
 	posNewline := indexFrom(text, fenceCloseNewline, start)
 	posBare := indexFrom(text, fenceCloseBare, start)
@@ -58,7 +60,9 @@ func FindFenceClose(text string, start int) (int, int) {
 	return posBare, len(fenceCloseBare)
 }
 
-// indexFrom 类似 strings.Index 但从指定位置开始
+// indexFrom 是 strings.Index 的增强版本，支持从指定偏移位置开始搜索。
+// 如果 start 小于 0 或大于字符串长度，直接返回 -1。
+// 找到子串后，返回的结果是基于原字符串的绝对位置（而非子串内的相对位置）。
 func indexFrom(s, substr string, start int) int {
 	if start < 0 || start > len(s) {
 		return -1
@@ -73,7 +77,9 @@ func indexFrom(s, substr string, start int) int {
 	return start + idx
 }
 
-// BuildToolCall 构建工具调用对象
+// BuildToolCall 构建一个符合 OpenAI 格式的工具调用对象。
+// 参数 name 是工具名称，arguments 是参数键值对，index 是调用序号（用于流式响应中标识第几个调用）。
+// 返回的 map 包含：唯一 ID（call_ + UUID 前24位）、类型 "function"、序号、函数名和序列化后的参数 JSON。
 func BuildToolCall(name string, arguments map[string]any, index int) map[string]any {
 	argsBytes, _ := sonic.MarshalString(arguments)
 	return map[string]any{
@@ -87,7 +93,10 @@ func BuildToolCall(name string, arguments map[string]any, index int) map[string]
 	}
 }
 
-// ExtractCallsFromPayload 从负载提取工具调用
+// ExtractCallsFromPayload 从 JSON 负载对象中提取工具调用列表。
+// payload 应为包含 "tool_calls" 数组的 map，每个元素包含 "name" 和 "arguments" 字段。
+// startIndex 指定第一个调用的序号起点，后续调用序号递增。
+// 返回符合 OpenAI 格式的工具调用对象切片；如果 payload 格式不正确或无有效调用，返回 nil。
 func ExtractCallsFromPayload(payload any, startIndex int) []map[string]any {
 	m, ok := payload.(map[string]any)
 	if !ok {
@@ -113,7 +122,9 @@ func ExtractCallsFromPayload(payload any, startIndex int) []map[string]any {
 	return toolCalls
 }
 
-// TryParseJSON 尝试解析 JSON，支持尾随逗号修复
+// TryParseJSON 尝试将文本解析为 JSON 对象。
+// 首先尝试直接解析，如果失败则尝试修复尾随逗号（LLM 输出常见问题）后再次解析。
+// 解析成功返回任意类型的 JSON 值，失败返回 nil。
 func TryParseJSON(text string) any {
 	stripped := strings.TrimSpace(text)
 	if stripped == "" {
@@ -131,10 +142,13 @@ func TryParseJSON(text string) any {
 	return nil
 }
 
+// trailingCommaRE 匹配 JSON 中 } 或 ] 前的尾随逗号，用于 FixCommonJsonErrors 修复 LLM 输出
 var trailingCommaRE = regexp.MustCompile(`,\s*([\]}])`)
 
-// ExtractFirstJSONObject 提取第一个平衡的 {...} JSON 对象
-// 返回 (对象文本, 范围 [start, end))，找不到返回 ("", nil)
+// ExtractFirstJSONObject 从 text 的 start 位置开始，提取第一个花括号平衡的 {...} JSON 对象。
+// 使用深度计数器跟踪大括号嵌套，正确处理字符串内的转义字符和引号。
+// 返回两个值：完整的 JSON 对象文本，以及其在原文中的 [start, end) 范围。
+// 如果找不到完整的 JSON 对象，返回 ("", [-1, -1])。
 func ExtractFirstJSONObject(text string, start int) (string, [2]int) {
 	pos := indexFrom(text, "{", start)
 	if pos == -1 {
@@ -172,8 +186,10 @@ func ExtractFirstJSONObject(text string, start int) (string, [2]int) {
 	return "", [2]int{-1, -1}
 }
 
-// ExtractCallArgsBalanced 从 [call:name]...[/call] 项中提取平衡的 JSON 参数
-// 返回 (argsJSON, endPosition)，找不到返回 ("", -1)
+// ExtractCallArgsBalanced 从 [call:name]...[/call] 格式的调用项中提取平衡的 JSON 参数。
+// 从 text 开头开始，找到第一个 '{' 并跟踪大括号深度，提取完整的 JSON 对象。
+// 返回两个值：JSON 参数字符串，以及参数结束后的文本位置。
+// 如果找不到有效 JSON，返回 ("", -1)。
 func ExtractCallArgsBalanced(text string) (string, int) {
 	pos := indexFrom(text, "{", 0)
 	if pos == -1 {
@@ -211,7 +227,9 @@ func ExtractCallArgsBalanced(text string) (string, int) {
 	return "", -1
 }
 
-// FixCommonJsonErrors 修复常见的 JSON 错误
+// FixCommonJsonErrors 修复 LLM 输出中常见的 JSON 格式错误。
+// 目前主要修复：移除 } 或 ] 前的尾随逗号（例如 {"a":1,} → {"a":1}）。
+// 如果输入为空，直接返回原值。
 func FixCommonJsonErrors(text string) string {
 	if text == "" {
 		return text
@@ -221,7 +239,10 @@ func FixCommonJsonErrors(text string) string {
 	return fixed
 }
 
-// RemoveSpans 从文本中移除指定范围，并清理结果
+// RemoveSpans 从文本中移除指定的字符范围，并清理结果中的多余空行和工具结果块。
+// spans 是需要移除的 [start, end) 范围列表，会按起始位置排序后依次移除。
+// 如果 spans 为空，仍会移除所有 ```tool_result 块并压缩连续空行。
+// trimOuterWhitespace 为 true 时，还会去除结果首尾的空白字符。
 func RemoveSpans(text string, spans [][2]int, trimOuterWhitespace bool) string {
 	if len(spans) == 0 {
 		cleaned := ToolResultFencePattern.ReplaceAllString(text, "")
@@ -261,10 +282,13 @@ func RemoveSpans(text string, spans [][2]int, trimOuterWhitespace bool) string {
 	return cleaned
 }
 
+// multiNewlineRE 匹配连续三个或更多换行符，用于 RemoveSpans 压缩多余空行
 var multiNewlineRE = regexp.MustCompile(`\n{3,}`)
 
-// ExtractFencedBlocks 从 [function_calls] 和 ```tool_code 块中提取工具调用
-// 返回 (spans, toolCalls)
+// ExtractFencedBlocks 从文本中提取所有用 ```tool_code 代码块或 [function_calls] 标签包裹的工具调用。
+// 支持两种格式：[function_calls][call:name]{...}[/call][/function_calls] 和 ```tool_code\n{...}\n```。
+// 返回两个值：需要从原文中移除的字符范围列表，以及解析出的工具调用对象列表。
+// 该函数会尝试解析 JSON，如果解析失败则尝试提取第一个平衡的 JSON 对象作为回退。
 func ExtractFencedBlocks(text string) ([][2]int, []map[string]any) {
 	var spans [][2]int
 	var toolCalls []map[string]any
@@ -360,7 +384,10 @@ func ExtractFencedBlocks(text string) ([][2]int, []map[string]any) {
 	return spans, toolCalls
 }
 
-// ExtractBareJSONBlocks 回退：扫描裸 {"tool_calls":...} JSON 对象
+// ExtractBareJSONBlocks 作为回退策略，扫描文本中裸露的 {"tool_calls":...} JSON 对象。
+// 跳过所有在 ``` 代码块内部的匹配，只处理代码块外的裸 JSON。
+// 找到后提取完整的 JSON 对象，解析并构建工具调用。
+// 返回需要移除的字符范围列表，以及解析出的工具调用列表。
 func ExtractBareJSONBlocks(text string) ([][2]int, []map[string]any) {
 	fenceMatches := AnyFencePattern.FindAllStringIndex(text, -1)
 	var fenceSpans [][2]int
@@ -410,7 +437,11 @@ func ExtractBareJSONBlocks(text string) ([][2]int, []map[string]any) {
 	return spans, toolCalls
 }
 
-// SalvageIncompleteFencedBlocks 从不完整的 ```tool_code 块中挽救工具调用
+// SalvageIncompleteFencedBlocks 从不完整的 ```tool_code 块中挽救工具调用。
+// "不完整"指有 ```tool_code 开始标记但没有 ``` 闭合标记的情况（常见于流式响应被截断）。
+// 从不完整块的剩余文本中提取第一个平衡的 JSON 对象，解析其中的工具调用。
+// existingCount 参数用于计算正确的调用序号偏移。
+// 返回需要移除的范围列表和挽救出的工具调用列表。
 func SalvageIncompleteFencedBlocks(text string, existingCount int) ([][2]int, []map[string]any) {
 	var spans [][2]int
 	var toolCalls []map[string]any
@@ -446,8 +477,13 @@ func SalvageIncompleteFencedBlocks(text string, existingCount int) ([][2]int, []
 	return spans, toolCalls
 }
 
-// ParseToolCallsFromText 从文本中解析工具调用
-// 返回 (清理后的文本, 工具调用列表)
+// ParseToolCallsFromText 从完整文本中解析工具调用，是主要的文本解析入口函数。
+// 按优先级尝试三种策略：
+// 1. 提取 ```tool_code 和 [function_calls] 块中的工具调用
+// 2. 如果没有找到，尝试挽救不完整的 ```tool_code 块
+// 3. 如果仍然没有，回退到裸 JSON 对象检测
+// 返回清理后的文本（移除所有工具调用块）和工具调用列表。
+// 如果文本中检测到工具相关标记但无法解析，会记录警告日志。
 func ParseToolCallsFromText(text string) (string, []map[string]any) {
 	if text == "" {
 		return "", nil
@@ -486,7 +522,8 @@ func ParseToolCallsFromText(text string) (string, []map[string]any) {
 	return RemoveSpans(text, spans, true), toolCalls
 }
 
-// truncateForLog 截断文本用于日志
+// truncateForLog 将文本截断到指定最大长度，用于日志输出避免过长。
+// 如果文本长度未超过限制，返回原文本。
 func truncateForLog(text string, maxLen int) string {
 	if len(text) <= maxLen {
 		return text
@@ -494,8 +531,10 @@ func truncateForLog(text string, maxLen int) string {
 	return text[:maxLen]
 }
 
-// FindPartialMarker 返回文本尾部部分 ```tool_code / ```tool_result 标记的起始位置
-// 找不到返回 -1
+// FindPartialMarker 检查文本尾部是否存在部分的 ```tool_code 或 ```tool_result 标记。
+// "部分"指标记被截断，例如 "```tool_co" 或 "```tool_resu"。
+// 从最长可能的标记开始，逐字符减少进行后缀匹配，返回部分标记在文本中的起始位置。
+// 找不到任何部分标记返回 -1。用于流式解析中判断是否需要等待更多数据。
 func FindPartialMarker(text string) int {
 	if text == "" {
 		return -1
@@ -515,19 +554,25 @@ func FindPartialMarker(text string) int {
 	return -1
 }
 
-// StreamingToolParser 流式工具调用解析器
+// StreamingToolParser 是流式文本解析器，用于在流式响应中逐步识别和提取工具调用。
+// 工作流程：通过 Consume 方法逐块输入文本，内部调用 SplitStreamText 进行实时解析。
+// 一旦识别到完整的工具调用，_toolCallCompleted 标记为 true，后续输入不再产生可见文本。
+// PendingText 缓存尚未完成解析的文本（例如正在等待闭合标记的代码块）。
 type StreamingToolParser struct {
 	PendingText       string
 	ToolCalls         []map[string]any
 	_toolCallCompleted bool
 }
 
-// NewStreamingToolParser 创建流式工具调用解析器
+// NewStreamingToolParser 创建并返回一个新的流式工具调用解析器实例。
 func NewStreamingToolParser() *StreamingToolParser {
 	return &StreamingToolParser{}
 }
 
-// Consume 消费一个块，返回可见文本
+// Consume 消费一个文本块，返回该块中可见的文本部分（不含工具调用标记）。
+// 如果之前已经完成了一个工具调用，后续块直接返回空字符串。
+// 内部将新块追加到 PendingText，调用 SplitStreamText 进行解析，
+// 将解析出的工具调用追加到 ToolCalls，未完成的部分保留在 PendingText 等待下一次输入。
 func (p *StreamingToolParser) Consume(chunk string) string {
 	if chunk == "" {
 		return ""
@@ -545,7 +590,11 @@ func (p *StreamingToolParser) Consume(chunk string) string {
 	return visible
 }
 
-// Flush 刷新剩余文本，返回 (可见文本, 工具调用列表)
+// Flush 刷新解析器中剩余的所有文本，在流式响应结束时调用。
+// 返回最终的可见文本和完整的工具调用列表。
+// 如果还有未完成的工具调用，直接返回已收集的结果。
+// 如果剩余文本中仍有未完成的代码块，尝试从不完整块中挽救工具调用。
+// 如果挽救失败，将剩余文本作为可见文本返回给用户。
 func (p *StreamingToolParser) Flush() (string, []map[string]any) {
 	if p._toolCallCompleted {
 		return "", p.ToolCalls
@@ -572,12 +621,19 @@ func (p *StreamingToolParser) Flush() (string, []map[string]any) {
 	return strings.TrimSpace(visible + tail), p.ToolCalls
 }
 
-// IsToolCallCompleted 返回工具调用是否已完成
+// IsToolCallCompleted 返回解析器是否已经识别到至少一个完整的工具调用。
+// 一旦返回 true，后续 Consume 调用将不再产生可见文本。
 func (p *StreamingToolParser) IsToolCallCompleted() bool {
 	return p._toolCallCompleted
 }
 
-// SplitStreamText 将文本拆分为 (可见文本, 剩余文本, 工具调用)
+// SplitStreamText 将文本拆分为三部分：可见文本、剩余未完成文本、和已解析的工具调用。
+// 这是流式解析的核心函数，按以下逻辑处理：
+// 1. 扫描 text 中的 ```tool_code 和 ```tool_result 标记
+// 2. tool_result 块被直接跳过（跳过整个块）
+// 3. tool_code 块：如果找到闭合标记则解析 JSON 提取工具调用；如果未闭合且 final=true 则尝试挽救
+// 4. 如果 final=false 且检测到部分标记（如 "```tool_co"），将其放入 remainder 等待更多数据
+// 返回 (可见文本部分, 需要缓存的剩余文本, 本次解析出的工具调用列表)
 func SplitStreamText(text string, final bool) (string, string, []map[string]any) {
 	var visibleParts []string
 	var toolCalls []map[string]any
@@ -688,7 +744,12 @@ func SplitStreamText(text string, final bool) (string, string, []map[string]any)
 	return strings.Join(visibleParts, ""), "", toolCalls
 }
 
-// SalvageIncompleteBlock 尝试从剩余的不完整块中挽救工具调用
+// SalvageIncompleteBlock 尝试从不完整的剩余文本中挽救工具调用。
+// 通常在流式响应结束时（Flush）或 final=true 的 SplitStreamText 中调用。
+// 支持两种格式的挽救：
+// 1. 有 ```tool_code 开始标记但没有闭合标记的块：提取标记后的 JSON
+// 2. 裸 JSON 对象（无代码块包裹）
+// 返回挽救出的工具调用列表，如果无法挽救返回 nil。
 func SalvageIncompleteBlock(text string, existingToolCalls []map[string]any) []map[string]any {
 	loc := ToolCodeStartPattern.FindStringIndex(text)
 	if loc == nil {
@@ -728,7 +789,9 @@ func SalvageIncompleteBlock(text string, existingToolCalls []map[string]any) []m
 	return nil
 }
 
-// findFrom 在 text 的 startFrom 位置之后查找正则的第一次匹配位置
+// findFrom 从 text 的 startFrom 位置开始，查找正则表达式 re 的第一次匹配位置。
+// 返回匹配在原文中的绝对起始位置；如果未找到或 startFrom 超出文本范围，返回 -1。
+// 用于在流式解析中从指定偏移位置搜索下一个标记。
 func findFrom(startFrom int, text string, re *regexp.Regexp) int {
 	if startFrom >= len(text) {
 		return -1
@@ -740,17 +803,19 @@ func findFrom(startFrom int, text string, re *regexp.Regexp) int {
 	return startFrom + loc[0]
 }
 
-// 重置 logger（用于测试）
+// ResetLogger 将工具解析器的日志记录器重置为默认值。
+// 主要用于测试场景，确保测试间日志状态隔离。
 func ResetLogger() {
 	toolParserLogger = slog.Default().With("logger", "glm2api.tool_parser")
 }
 
-// SetLogger 设置自定义 logger
+// SetLogger 设置自定义的日志记录器，替换默认的工具解析器日志记录器。
+// 传入 nil 不会产生任何效果，保留现有的日志记录器不变。
 func SetLogger(l *slog.Logger) {
 	if l != nil {
 		toolParserLogger = l
 	}
 }
 
-// 用于避免未使用导入
+// time.Now 引用确保 time 包被使用（避免未使用的导入编译错误）
 var _ = time.Now
