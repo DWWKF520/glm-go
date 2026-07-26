@@ -278,15 +278,8 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 			}
 			// 检查事件中是否有错误 part，尝试过滤掉错误部分后继续处理
 			if err := c.raiseForEventError(event, true); err != nil {
-				cleaned := c.filterErrorParts(event)
-				if len(cleaned) > 0 {
-					c.logger.Warn("GLM 流式事件包含错误 part，已过滤", "error", err, "filtered_parts", len(cleaned))
-					event["parts"] = cleaned
-				} else {
-					// 所有 part 均有错误，跳过此事件继续处理下一个，避免单个 part 错误中断整个流
-					c.logger.Warn("GLM 流式事件所有 part 均有错误，跳过此事件", "error", err)
-					continue
-				}
+				c.logger.Warn("GLM 流式事件所有 part 均有错误，跳过此事件", "error", err)
+				continue
 			}
 			// 将 GLM 事件转换为 OpenAI 格式的 SSE chunks
 			chunks, status := accumulator.ConsumeEvent(event)

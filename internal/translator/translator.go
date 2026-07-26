@@ -356,9 +356,9 @@ func ConvertMessages(
 	}
 	var processed []processedItem
 	latestUserURL := ExtractRecentUserURL(messages)
-	validToolCallIDs := map[string]bool{}      // 记录有效的工具调用 ID
-	repairedToolCallIDs := map[string]bool{}    // 记录被修复的工具调用 ID
-	toolCallIDToName := map[string]string{}     // 工具调用 ID → 工具名称映射
+	validToolCallIDs := map[string]bool{}    // 记录有效的工具调用 ID
+	repairedToolCallIDs := map[string]bool{} // 记录被修复的工具调用 ID
+	toolCallIDToName := map[string]string{}  // 工具调用 ID → 工具名称映射
 
 	for _, message := range messages {
 		role, _ := message["role"].(string)
@@ -545,24 +545,24 @@ type GLMEventAccumulator struct {
 
 	// parts 管理
 	partsByLogicID            map[string]map[string]any // logic_id → part 数据
-	orderedLogicIDs           []string                   // 按字母序排列的 logic_id 列表
-	lastFullText              string                     // 上一次完整渲染的文本
-	lastFullReasoning         string                     // 上一次完整渲染的推理内容
-	partTextSent              map[string]int             // 每个 part 已发送的文本长度
-	partReasoningSent         map[string]int             // 每个 part 已发送的推理长度
-	knownLogicIDsForText      []string                   // 已知的文本 part ID 列表
-	knownLogicIDsForReasoning []string                   // 已知的推理 part ID 列表
+	orderedLogicIDs           []string                  // 按字母序排列的 logic_id 列表
+	lastFullText              string                    // 上一次完整渲染的文本
+	lastFullReasoning         string                    // 上一次完整渲染的推理内容
+	partTextSent              map[string]int            // 每个 part 已发送的文本长度
+	partReasoningSent         map[string]int            // 每个 part 已发送的推理长度
+	knownLogicIDsForText      []string                  // 已知的文本 part ID 列表
+	knownLogicIDsForReasoning []string                  // 已知的推理 part ID 列表
 
 	// 工具调用解析
 	toolParser *tools.StreamingToolParser // 流式工具调用解析器
 
 	// 输出控制
-	emittedRole          bool               // 是否已发送 role 字段（OpenAI SSE 要求 role 只发送一次）
-	renderCacheDirty     bool               // 渲染缓存是否需要刷新
-	cachedFullText       string             // 缓存的完整文本
-	cachedFullReasoning  string             // 缓存的完整推理内容
-	cachedPartTexts      map[string]string  // 每个 part 的渲染文本缓存
-	cachedPartReasonings map[string]string  // 每个 part 的渲染推理缓存
+	emittedRole          bool              // 是否已发送 role 字段（OpenAI SSE 要求 role 只发送一次）
+	renderCacheDirty     bool              // 渲染缓存是否需要刷新
+	cachedFullText       string            // 缓存的完整文本
+	cachedFullReasoning  string            // 缓存的完整推理内容
+	cachedPartTexts      map[string]string // 每个 part 的渲染文本缓存
+	cachedPartReasonings map[string]string // 每个 part 的渲染推理缓存
 
 	// 服务端工具调用
 	serverSideToolCalls   []map[string]any // GLM 服务端原生工具调用列表
@@ -907,112 +907,6 @@ func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) 
 	chunks = append(chunks, "data: [DONE]\n\n")
 	logging.DebugDump(a.Logger, a.DebugEnabled, "GLM SSE finalize 输出", chunks)
 	return chunks
-}
-
-// BuildResponse 构建非流式（chat.completion）响应
-//
-// 与流式的 ConsumeEvent/Finalize 不同，本方法在所有事件处理完毕后
-// 一次性构建完整的 OpenAI chat.completion 响应对象。
-//
-// 处理流程：
-//  1. 渲染完整的文本和推理内容
-//  2. 从文本中解析工具调用
-//  3. 合并服务端和 JSON 工具调用
-//  4. 构建符合 OpenAI 规范的响应体
-func (a *GLMEventAccumulator) BuildResponse() map[string]any {
-	fullText, fullReasoning := a.renderFullOutput()
-	if fullText == "" && a.lastFullText != "" {
-		fullText = a.lastFullText
-	}
-	if fullReasoning == "" && a.lastFullReasoning != "" {
-		fullReasoning = a.lastFullReasoning
-	}
-	// 从完整文本中解析工具调用
-	cleanContent, jsonToolCalls := tools.ParseToolCallsFromText(strings.TrimSpace(fullText))
-	jsonToolCalls = SanitizeToolCalls(jsonToolCalls, a.FallbackToolURL)
-	// 如果文本中没有工具调用，尝试从推理内容中提取
-	if len(jsonToolCalls) == 0 {
-		jsonToolCalls = a.extractReasoningToolCalls(fullReasoning)
-	}
-
-	// 合并服务端和 JSON 工具调用，重新索引
-	allToolCalls := make([]map[string]any, len(a.serverSideToolCalls))
-	copy(allToolCalls, a.serverSideToolCalls)
-	for _, tc := range jsonToolCalls {
-		tcCopy := map[string]any{}
-		for k, v := range tc {
-			tcCopy[k] = v
-		}
-		tcCopy["index"] = len(allToolCalls)
-		allToolCalls = append(allToolCalls, tcCopy)
-	}
-
-	// 构建 content：有工具调用时设为 nil（OpenAI 规范）
-	finalContent := strings.TrimSpace(cleanContent)
-	var contentValue any
-	if len(allToolCalls) > 0 || finalContent == "" {
-		contentValue = nil
-	} else {
-		contentValue = finalContent
-	}
-
-	var reasoningValue any
-	if fullReasoning != "" {
-		reasoningValue = fullReasoning
-	} else {
-		reasoningValue = nil
-	}
-
-	message := map[string]any{
-		"role":              "assistant",
-		"content":           contentValue,
-		"reasoning_content": reasoningValue,
-	}
-	if len(allToolCalls) > 0 {
-		var toolCallsList []map[string]any
-		for _, item := range allToolCalls {
-			toolCallsList = append(toolCallsList, map[string]any{
-				"id":       item["id"],
-				"type":     "function",
-				"function": item["function"],
-			})
-		}
-		message["tool_calls"] = toolCallsList
-	}
-
-	finishReason := "stop"
-	if len(allToolCalls) > 0 {
-		finishReason = "tool_calls"
-	}
-
-	response := map[string]any{
-		"id":      a.ConversationID,
-		"object":  "chat.completion",
-		"created": a.Created,
-		"model":   a.Model,
-		"choices": []map[string]any{
-			{
-				"index":         0,
-				"message":       message,
-				"finish_reason": finishReason,
-			},
-		},
-		"usage": map[string]any{
-			"prompt_tokens":     1,
-			"completion_tokens": 1,
-			"total_tokens":      2,
-		},
-	}
-	if a.Logger != nil {
-		a.Logger.Info("非流式响应构建完成",
-			"model", a.Model,
-			"text_len", len(finalContent),
-			"reasoning_len", len(fullReasoning),
-			"tool_calls", len(allToolCalls),
-		)
-	}
-	logging.DebugDump(a.Logger, a.DebugEnabled, "GLM 非流式最终响应", response)
-	return response
 }
 
 // GetOrderedParts 返回按 logic_id 排序的 parts 列表
