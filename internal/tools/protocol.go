@@ -9,20 +9,6 @@ import (
 	"github.com/bytedance/sonic"
 )
 
-// 被屏蔽的原生工具名
-var BlockedNativeToolNames = map[string]bool{
-	"open":         true,
-	"open_url":     true,
-	"open_ul":      true,
-	"browser.open": true,
-	"web.run":      true,
-	"web.open":     true,
-	"web.search":   true,
-	"web_search":   true,
-	"browse":       true,
-	"open_link":    true,
-}
-
 // ServerSideToolNames 服务端工具名（空集合）
 var ServerSideToolNames = map[string]bool{}
 
@@ -55,13 +41,9 @@ func NormalizeToolName(name any) string {
 }
 
 // FilterTools 过滤工具列表
-func FilterTools(tools []map[string]any, blockedToolNames map[string]bool) []map[string]any {
+func FilterTools(tools []map[string]any) []map[string]any {
 	if len(tools) == 0 {
 		return nil
-	}
-	blocked := make(map[string]bool)
-	for k, v := range blockedToolNames {
-		blocked[k] = v
 	}
 	filtered := []map[string]any{}
 	for _, tool := range tools {
@@ -70,7 +52,7 @@ func FilterTools(tools []map[string]any, blockedToolNames map[string]bool) []map
 			continue
 		}
 		toolName := NormalizeToolName(fn["name"])
-		if toolName == "" || blocked[toolName] {
+		if toolName == "" {
 			continue
 		}
 		filtered = append(filtered, tool)
@@ -304,7 +286,7 @@ func BuildToolCallInstructions(toolNames []string, serverSideToolNames map[strin
 }
 
 // ToolsToPrompt 将工具列表转换为提示词
-func ToolsToPrompt(tools []map[string]any, blockedToolNames map[string]bool, policy ToolChoicePolicy, serverSideToolNames map[string]bool) string {
+func ToolsToPrompt(tools []map[string]any, policy ToolChoicePolicy, serverSideToolNames map[string]bool) string {
 	var toolNames []string
 	var toolSchemas []string
 	for _, tool := range tools {
@@ -321,9 +303,6 @@ func ToolsToPrompt(tools []map[string]any, blockedToolNames map[string]bool, pol
 			description = d
 		}
 		parameters := fn["parameters"]
-		if blockedToolNames != nil && blockedToolNames[name] {
-			continue
-		}
 		toolNames = append(toolNames, name)
 		paramsJSON := "{}"
 		if p, ok := parameters.(map[string]any); ok {

@@ -44,7 +44,6 @@ var (
 		"cogView-4-250304":    true,
 		DefaultImageModelName: true,
 	}
-	DefaultBlockedToolNames = []string{}
 )
 
 // ConfigError 配置错误
@@ -82,7 +81,6 @@ type AppConfig struct {
 	GLMBusyMaxRetries       int
 	GLMBusyRetryInterval    float64
 	GLMGuestMaxRetries      int
-	BlockedToolNames        []string
 	ExposedModels           []string
 	ModelAliases            map[string]string
 	ServerAPIKeys           []string
@@ -427,7 +425,6 @@ func LoadConfig(envFile string) (*AppConfig, error) {
 		GLMBusyMaxRetries:       busyMaxRetries,
 		GLMBusyRetryInterval:    busyRetryInterval,
 		GLMGuestMaxRetries:      guestMaxRetries,
-		BlockedToolNames:        ParseList(values["BLOCKED_TOOL_NAMES"], DefaultBlockedToolNames),
 		ServerAPIKeys:           ParseList(values["SERVER_API_KEYS"], nil),
 		CORSAllowOrigin:         getOrDefault(values, "CORS_ALLOW_ORIGIN", "*"),
 	}

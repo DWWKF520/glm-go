@@ -73,17 +73,6 @@ func indexFrom(s, substr string, start int) int {
 	return start + idx
 }
 
-// IsAllowedToolName 判断工具名是否允许
-func IsAllowedToolName(toolName string, allowedToolNames map[string]bool) bool {
-	if BlockedNativeToolNames[toolName] {
-		return false
-	}
-	if allowedToolNames == nil {
-		return true
-	}
-	return allowedToolNames[toolName]
-}
-
 // BuildToolCall 构建工具调用对象
 func BuildToolCall(name string, arguments map[string]any, index int) map[string]any {
 	argsBytes, _ := sonic.MarshalString(arguments)
@@ -99,7 +88,7 @@ func BuildToolCall(name string, arguments map[string]any, index int) map[string]
 }
 
 // ExtractCallsFromPayload 从负载提取工具调用
-func ExtractCallsFromPayload(payload any, allowedToolNames map[string]bool, startIndex int) []map[string]any {
+func ExtractCallsFromPayload(payload any, startIndex int) []map[string]any {
 	m, ok := payload.(map[string]any)
 	if !ok {
 		return nil
@@ -115,7 +104,7 @@ func ExtractCallsFromPayload(payload any, allowedToolNames map[string]bool, star
 			continue
 		}
 		name := strings.TrimSpace(fmt.Sprintf("%v", call["name"]))
-		if name == "" || !IsAllowedToolName(name, allowedToolNames) {
+		if name == "" {
 			continue
 		}
 		arguments := NormalizeArguments(call["arguments"])
@@ -276,7 +265,7 @@ var multiNewlineRE = regexp.MustCompile(`\n{3,}`)
 
 // ExtractFencedBlocks 从 [function_calls] 和 ```tool_code 块中提取工具调用
 // 返回 (spans, toolCalls)
-func ExtractFencedBlocks(text string, allowedToolNames map[string]bool) ([][2]int, []map[string]any) {
+func ExtractFencedBlocks(text string) ([][2]int, []map[string]any) {
 	var spans [][2]int
 	var toolCalls []map[string]any
 
@@ -309,7 +298,7 @@ func ExtractFencedBlocks(text string, allowedToolNames map[string]bool) ([][2]in
 				continue
 			}
 
-			if name == "" || !IsAllowedToolName(name, allowedToolNames) {
+			if name == "" {
 				cursor = argsStartPos + argsEnd
 				continue
 			}
@@ -361,7 +350,7 @@ func ExtractFencedBlocks(text string, allowedToolNames map[string]bool) ([][2]in
 		}
 
 		if payload != nil {
-			blockCalls := ExtractCallsFromPayload(payload, allowedToolNames, len(toolCalls))
+			blockCalls := ExtractCallsFromPayload(payload, len(toolCalls))
 			if len(blockCalls) > 0 {
 				toolCalls = append(toolCalls, blockCalls...)
 			}
@@ -372,7 +361,7 @@ func ExtractFencedBlocks(text string, allowedToolNames map[string]bool) ([][2]in
 }
 
 // ExtractBareJSONBlocks 回退：扫描裸 {"tool_calls":...} JSON 对象
-func ExtractBareJSONBlocks(text string, allowedToolNames map[string]bool) ([][2]int, []map[string]any) {
+func ExtractBareJSONBlocks(text string) ([][2]int, []map[string]any) {
 	fenceMatches := AnyFencePattern.FindAllStringIndex(text, -1)
 	var fenceSpans [][2]int
 	for _, m := range fenceMatches {
@@ -411,7 +400,7 @@ func ExtractBareJSONBlocks(text string, allowedToolNames map[string]bool) ([][2]
 			cursor = span[1]
 			continue
 		}
-		blockCalls := ExtractCallsFromPayload(payload, allowedToolNames, len(toolCalls))
+		blockCalls := ExtractCallsFromPayload(payload, len(toolCalls))
 		if len(blockCalls) > 0 {
 			toolCalls = append(toolCalls, blockCalls...)
 			spans = append(spans, span)
@@ -422,7 +411,7 @@ func ExtractBareJSONBlocks(text string, allowedToolNames map[string]bool) ([][2]
 }
 
 // SalvageIncompleteFencedBlocks 从不完整的 ```tool_code 块中挽救工具调用
-func SalvageIncompleteFencedBlocks(text string, allowedToolNames map[string]bool, existingCount int) ([][2]int, []map[string]any) {
+func SalvageIncompleteFencedBlocks(text string, existingCount int) ([][2]int, []map[string]any) {
 	var spans [][2]int
 	var toolCalls []map[string]any
 
@@ -444,7 +433,7 @@ func SalvageIncompleteFencedBlocks(text string, allowedToolNames map[string]bool
 		if payload == nil {
 			continue
 		}
-		blockCalls := ExtractCallsFromPayload(payload, allowedToolNames, existingCount+len(toolCalls))
+		blockCalls := ExtractCallsFromPayload(payload, existingCount+len(toolCalls))
 		if len(blockCalls) > 0 {
 			toolCalls = append(toolCalls, blockCalls...)
 			endPos := bodyStart + len(body)
@@ -459,22 +448,22 @@ func SalvageIncompleteFencedBlocks(text string, allowedToolNames map[string]bool
 
 // ParseToolCallsFromText 从文本中解析工具调用
 // 返回 (清理后的文本, 工具调用列表)
-func ParseToolCallsFromText(text string, allowedToolNames map[string]bool) (string, []map[string]any) {
+func ParseToolCallsFromText(text string) (string, []map[string]any) {
 	if text == "" {
 		return "", nil
 	}
-	spans, toolCalls := ExtractFencedBlocks(text, allowedToolNames)
+	spans, toolCalls := ExtractFencedBlocks(text)
 
 	if len(toolCalls) == 0 {
 		// 尝试挽救不完整块
-		incSpans, incCalls := SalvageIncompleteFencedBlocks(text, allowedToolNames, 0)
+		incSpans, incCalls := SalvageIncompleteFencedBlocks(text, 0)
 		if len(incCalls) > 0 {
 			toolParserLogger.Debug("parse_tool_calls_from_text: salvaged tool calls from incomplete block(s)", "count", len(incCalls))
 			allSpans := append(spans, incSpans...)
 			return RemoveSpans(text, allSpans, true), incCalls
 		}
 		// 回退到裸 JSON 检测
-		bareSpans, bareCalls := ExtractBareJSONBlocks(text, allowedToolNames)
+		bareSpans, bareCalls := ExtractBareJSONBlocks(text)
 		if len(bareCalls) > 0 {
 			toolParserLogger.Debug("parse_tool_calls_from_text: bare-JSON fallback recovered tool calls", "count", len(bareCalls), "text_len", len(text))
 			return RemoveSpans(text, bareSpans, true), bareCalls
@@ -530,7 +519,6 @@ func FindPartialMarker(text string) int {
 type StreamingToolParser struct {
 	PendingText       string
 	ToolCalls         []map[string]any
-	AllowedToolNames  map[string]bool
 	_toolCallCompleted bool
 }
 
@@ -548,7 +536,7 @@ func (p *StreamingToolParser) Consume(chunk string) string {
 		return ""
 	}
 	p.PendingText += chunk
-	visible, remainder, parsedCalls := SplitStreamText(p.PendingText, p.AllowedToolNames, false)
+	visible, remainder, parsedCalls := SplitStreamText(p.PendingText, false)
 	p.PendingText = remainder
 	p.ToolCalls = append(p.ToolCalls, parsedCalls...)
 	if len(parsedCalls) > 0 {
@@ -562,7 +550,7 @@ func (p *StreamingToolParser) Flush() (string, []map[string]any) {
 	if p._toolCallCompleted {
 		return "", p.ToolCalls
 	}
-	visible, remainder, parsedCalls := SplitStreamText(p.PendingText, p.AllowedToolNames, true)
+	visible, remainder, parsedCalls := SplitStreamText(p.PendingText, true)
 	p.ToolCalls = append(p.ToolCalls, parsedCalls...)
 	if len(parsedCalls) > 0 {
 		p._toolCallCompleted = true
@@ -570,7 +558,7 @@ func (p *StreamingToolParser) Flush() (string, []map[string]any) {
 
 	tail := ""
 	if remainder != "" && !p._toolCallCompleted {
-		salvaged := SalvageIncompleteBlock(remainder, p.AllowedToolNames, p.ToolCalls)
+		salvaged := SalvageIncompleteBlock(remainder, p.ToolCalls)
 		if salvaged != nil {
 			p.PendingText = ""
 			p._toolCallCompleted = true
@@ -590,7 +578,7 @@ func (p *StreamingToolParser) IsToolCallCompleted() bool {
 }
 
 // SplitStreamText 将文本拆分为 (可见文本, 剩余文本, 工具调用)
-func SplitStreamText(text string, allowedToolNames map[string]bool, final bool) (string, string, []map[string]any) {
+func SplitStreamText(text string, final bool) (string, string, []map[string]any) {
 	var visibleParts []string
 	var toolCalls []map[string]any
 	cursor := 0
@@ -664,7 +652,7 @@ func SplitStreamText(text string, allowedToolNames map[string]bool, final bool) 
 				if payload == nil {
 					payload = map[string]any{}
 				}
-				salvaged := ExtractCallsFromPayload(payload, allowedToolNames, len(toolCalls))
+				salvaged := ExtractCallsFromPayload(payload, len(toolCalls))
 				if len(salvaged) > 0 {
 					toolCalls = append(toolCalls, salvaged...)
 					cursor = len(text)
@@ -684,7 +672,7 @@ func SplitStreamText(text string, allowedToolNames map[string]bool, final bool) 
 		body := text[markerEnd:bodyEnd]
 		payload := TryParseJSON(body)
 		if payload != nil {
-			blockCalls := ExtractCallsFromPayload(payload, allowedToolNames, len(toolCalls))
+			blockCalls := ExtractCallsFromPayload(payload, len(toolCalls))
 			if len(blockCalls) > 0 {
 				toolCalls = append(toolCalls, blockCalls...)
 			}
@@ -701,7 +689,7 @@ func SplitStreamText(text string, allowedToolNames map[string]bool, final bool) 
 }
 
 // SalvageIncompleteBlock 尝试从剩余的不完整块中挽救工具调用
-func SalvageIncompleteBlock(text string, allowedToolNames map[string]bool, existingToolCalls []map[string]any) []map[string]any {
+func SalvageIncompleteBlock(text string, existingToolCalls []map[string]any) []map[string]any {
 	loc := ToolCodeStartPattern.FindStringIndex(text)
 	if loc == nil {
 		// 也许是一个裸 JSON 对象
@@ -713,7 +701,7 @@ func SalvageIncompleteBlock(text string, allowedToolNames map[string]bool, exist
 		if payload == nil {
 			return nil
 		}
-		blockCalls := ExtractCallsFromPayload(payload, allowedToolNames, len(existingToolCalls))
+		blockCalls := ExtractCallsFromPayload(payload, len(existingToolCalls))
 		if len(blockCalls) > 0 {
 			existingToolCalls = append(existingToolCalls, blockCalls...)
 			toolParserLogger.Debug("Salvaged tool call(s) from incomplete bare JSON remainder", "count", len(blockCalls))
@@ -731,7 +719,7 @@ func SalvageIncompleteBlock(text string, allowedToolNames map[string]bool, exist
 	if payload == nil {
 		return nil
 	}
-	blockCalls := ExtractCallsFromPayload(payload, allowedToolNames, len(existingToolCalls))
+	blockCalls := ExtractCallsFromPayload(payload, len(existingToolCalls))
 	if len(blockCalls) > 0 {
 		existingToolCalls = append(existingToolCalls, blockCalls...)
 		toolParserLogger.Debug("Salvaged tool call(s) from incomplete tool_code remainder", "count", len(blockCalls))

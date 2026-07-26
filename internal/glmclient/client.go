@@ -189,7 +189,8 @@ func NewClient(cfg *config.AppConfig, logger *slog.Logger) *Client {
 // StreamChatCompletion 流式聊天补全
 // 返回一个 channel，持续输出 SSE chunks ([]byte)
 func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]any) (<-chan []byte, error) {
-	_, allowedToolNames := c.resolveTools(payload)
+	filteredTools := c.resolveTools(payload)
+	_ = filteredTools
 	lease, err := c.RequestQueue.Acquire(fmt.Sprintf("stream:%v", payload["model"]))
 	if err != nil {
 		return nil, err
@@ -203,7 +204,6 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 
 	accumulator := translator.NewGLMEventAccumulator(
 		fmt.Sprintf("%v", payload["model"]),
-		allowedToolNames,
 		translator.ExtractRecentUserURL(getMessagesList(payload)),
 		c.config.DebugDumpAll,
 		c.logger,
@@ -269,7 +269,6 @@ func (c *Client) GenerateImages(ctx context.Context, payload map[string]any) (ma
 
 	accumulator := translator.NewGLMEventAccumulator(
 		getModelName(payload, c.config.GLMImageModelName),
-		nil,
 		"",
 		c.config.DebugDumpAll,
 		c.logger,
@@ -359,7 +358,7 @@ func (c *Client) DeleteConversation(ctx context.Context, conversationID, assista
 	c.logger.Info("已删除 GLM 会话", "conversation_id", conversationID, "assistant_id", actualAssistantID)
 }
 
-func (c *Client) resolveTools(openaiPayload map[string]any) ([]map[string]any, map[string]bool) {
+func (c *Client) resolveTools(openaiPayload map[string]any) []map[string]any {
 	var rawTools []map[string]any
 	if tools, ok := openaiPayload["tools"].([]any); ok {
 		for _, t := range tools {
@@ -368,71 +367,18 @@ func (c *Client) resolveTools(openaiPayload map[string]any) ([]map[string]any, m
 			}
 		}
 	}
-	blockedToolNames := map[string]bool{}
-	for _, name := range c.config.BlockedToolNames {
-		name = strings.TrimSpace(name)
-		if name != "" {
-			blockedToolNames[name] = true
-		}
-	}
-	for n := range tools.BlockedNativeToolNames {
-		blockedToolNames[n] = true
-	}
-	filteredTools := tools.FilterTools(rawTools, blockedToolNames)
-
-	if len(rawTools) > 0 && len(filteredTools) != len(rawTools) {
-		var blockedNames []string
-		for _, t := range rawTools {
-			fn, _ := t["function"].(map[string]any)
-			if fn == nil {
-				continue
-			}
-			name, _ := fn["name"].(string)
-			name = strings.TrimSpace(name)
-			if blockedToolNames[name] {
-				blockedNames = append(blockedNames, name)
-			}
-		}
-		if len(blockedNames) > 0 {
-			c.logger.Info("已过滤不受支持的工具", "tools", strings.Join(blockedNames, ", "))
-		}
-	}
-
-	// 与 Python 一致：无工具时返回 nil（表示不限制工具名），而非空 map（表示禁止所有工具）
-	var allowedToolNames map[string]bool
-	if len(filteredTools) > 0 {
-		allowedToolNames = map[string]bool{}
-		for _, t := range filteredTools {
-			fn, _ := t["function"].(map[string]any)
-			if fn == nil {
-				continue
-			}
-			name, _ := fn["name"].(string)
-			name = strings.TrimSpace(name)
-			if name != "" {
-				allowedToolNames[name] = true
-			}
-		}
-	}
-	return filteredTools, allowedToolNames
+	filteredTools := tools.FilterTools(rawTools)
+	return filteredTools
 }
 
 func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]any, preferredAccountIndex *int) (*http.Response, string, error) {
 	upstreamModel := openaiPayload["model"].(string)
 	assistantID := c.config.GLMAssistantID
-	filteredTools, _ := c.resolveTools(openaiPayload)
+	filteredTools := c.resolveTools(openaiPayload)
 
-	blockedToolNames := map[string]bool{}
-	for _, name := range c.config.BlockedToolNames {
-		name = strings.TrimSpace(name)
-		if name != "" {
-			blockedToolNames[name] = true
-		}
-	}
 	convertedMessages := translator.ConvertMessages(
 		getMessagesList(openaiPayload),
 		filteredTools,
-		blockedToolNames,
 		openaiPayload["tool_choice"],
 		tools.ServerSideToolNames,
 	)

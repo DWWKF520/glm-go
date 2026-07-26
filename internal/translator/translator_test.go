@@ -3,8 +3,6 @@ package translator
 import (
 	"strings"
 	"testing"
-
-	"glm2api/internal/tools"
 )
 
 // TestLocalFileHintConstant 验证 LocalFileHint 与 Python LOCAL_FILE_HINT 一致
@@ -124,31 +122,9 @@ func TestExtractTextContentFiltersEmpty(t *testing.T) {
 	}
 }
 
-// TestNewGLMEventAccumulatorSetsToolParserAllowedNames 验证构造时同步 allowed_tool_names 到流式解析器
-func TestNewGLMEventAccumulatorSetsToolParserAllowedNames(t *testing.T) {
-	allowed := map[string]bool{"Read": true, "Write": true}
-	acc := NewGLMEventAccumulator("model", allowed, "", false, nil)
-	if acc.toolParser.AllowedToolNames == nil {
-		t.Fatal("toolParser.AllowedToolNames is nil, expected to be set")
-	}
-	if !acc.toolParser.AllowedToolNames["Read"] {
-		t.Error("toolParser.AllowedToolNames missing 'Read'")
-	}
-	if !acc.toolParser.AllowedToolNames["Write"] {
-		t.Error("toolParser.AllowedToolNames missing 'Write'")
-	}
-
-	// nil 也应同步
-	acc2 := NewGLMEventAccumulator("model", nil, "", false, nil)
-	if acc2.toolParser.AllowedToolNames != nil {
-		t.Errorf("expected nil AllowedToolNames, got %v", acc2.toolParser.AllowedToolNames)
-	}
-}
-
 // TestConsumeEventToolCallComplete 验证工具调用完成后后续事件返回 tool_call_complete
 func TestConsumeEventToolCallComplete(t *testing.T) {
-	// nil allowed_tool_names → 所有工具允许
-	acc := NewGLMEventAccumulator("model", nil, "", false, nil)
+	acc := NewGLMEventAccumulator("model", "", false, nil)
 
 	// 构造一个包含完整 tool_code 块的事件
 	toolBlock := "```tool_code\n" +
@@ -199,5 +175,4 @@ func TestConsumeEventToolCallComplete(t *testing.T) {
 		t.Errorf("expected no chunks, got %d", len(chunks))
 	}
 	_ = status
-	_ = tools.BlockedNativeToolNames // 确保 tools 包被引用
 }

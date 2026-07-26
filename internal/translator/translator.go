@@ -244,11 +244,10 @@ func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string) []map[str
 func ConvertMessages(
 	messages []map[string]any,
 	toolsList []map[string]any,
-	blockedToolNames map[string]bool,
 	toolChoice any,
 	serverSideToolNames map[string]bool,
 ) []map[string]any {
-	filteredTools := tools.FilterTools(toolsList, blockedToolNames)
+	filteredTools := tools.FilterTools(toolsList)
 	availableToolNames := map[string]bool{}
 	for _, t := range filteredTools {
 		fn, _ := t["function"].(map[string]any)
@@ -387,7 +386,7 @@ func ConvertMessages(
 	var transcriptParts []string
 	if len(filteredTools) > 0 && toolChoicePolicy.Mode != "none" {
 		transcriptParts = append(transcriptParts,
-			tools.ToolsToPrompt(filteredTools, blockedToolNames, toolChoicePolicy, serverSideToolNames),
+			tools.ToolsToPrompt(filteredTools, toolChoicePolicy, serverSideToolNames),
 			"# CONVERSATION",
 		)
 	}
@@ -429,7 +428,6 @@ func ConvertMessages(
 // GLMEventAccumulator GLM 事件累加器
 type GLMEventAccumulator struct {
 	Model            string
-	AllowedToolNames map[string]bool
 	FallbackToolURL  string
 	DebugEnabled     bool
 	Logger           *slog.Logger
@@ -453,19 +451,15 @@ type GLMEventAccumulator struct {
 	cachedPartReasonings      map[string]string
 	serverSideToolCalls       []map[string]any
 	serverSideToolCallIDs     map[string]bool
-	blockedToolCallIDs        map[string]bool
-	blockedToolResultText     string
-	deferredVisibleText       string
 }
 
 // NewGLMEventAccumulator 创建事件累加器
-func NewGLMEventAccumulator(model string, allowedToolNames map[string]bool, fallbackToolURL string, debugEnabled bool, logger *slog.Logger) *GLMEventAccumulator {
+func NewGLMEventAccumulator(model string, fallbackToolURL string, debugEnabled bool, logger *slog.Logger) *GLMEventAccumulator {
 	if logger == nil {
 		logger = logging.GetLogger("glm2api.null")
 	}
 	acc := &GLMEventAccumulator{
 		Model:                 model,
-		AllowedToolNames:      allowedToolNames,
 		FallbackToolURL:       fallbackToolURL,
 		DebugEnabled:          debugEnabled,
 		Logger:                logger,
@@ -477,11 +471,8 @@ func NewGLMEventAccumulator(model string, allowedToolNames map[string]bool, fall
 		cachedPartTexts:       map[string]string{},
 		cachedPartReasonings:  map[string]string{},
 		serverSideToolCallIDs: map[string]bool{},
-		blockedToolCallIDs:    map[string]bool{},
 		renderCacheDirty:      true,
 	}
-	// 与 Python __post_init__ 一致：将 allowed_tool_names 同步到流式工具解析器
-	acc.toolParser.AllowedToolNames = allowedToolNames
 	return acc
 }
 
@@ -543,15 +534,6 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						toolID = strings.TrimSpace(toolID)
 						arguments := toolCallsData["arguments"]
 
-						if tools.BlockedNativeToolNames[toolName] {
-							if toolID != "" {
-								a.blockedToolCallIDs[toolID] = true
-							}
-							continue
-						}
-						if a.AllowedToolNames != nil && !a.AllowedToolNames[toolName] {
-							continue
-						}
 						if toolName != "" && toolID != "" && !a.serverSideToolCallIDs[toolID] {
 							a.serverSideToolCallIDs[toolID] = true
 							argsStr := "{}"
@@ -569,32 +551,6 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 									"arguments": argsStr,
 								},
 							})
-						}
-					}
-					// 转换被屏蔽工具的结果为纯文本
-					if contentType == "tool_result" {
-						toolResultData, _ := content["tool_calls"].(map[string]any)
-						resultToolID, _ := toolResultData["id"].(string)
-						resultToolID = strings.TrimSpace(resultToolID)
-						if a.blockedToolCallIDs[resultToolID] {
-							var resultTextParts []string
-							meta, _ := part["meta_data"].(map[string]any)
-							toolExtra, _ := meta["tool_result_extra"].(map[string]any)
-							searchResults, _ := toolExtra["search_results"].([]any)
-							for _, sr := range searchResults {
-								srm, _ := sr.(map[string]any)
-								text, _ := srm["text"].(string)
-								title, _ := srm["title"].(string)
-								url, _ := srm["url"].(string)
-								if text != "" {
-									resultTextParts = append(resultTextParts, text)
-								} else if title != "" {
-									resultTextParts = append(resultTextParts, fmt.Sprintf("%s (%s)", title, url))
-								}
-							}
-							if len(resultTextParts) > 0 {
-								a.blockedToolResultText = strings.Join(resultTextParts, "\n\n")
-							}
 						}
 					}
 				}
@@ -621,24 +577,20 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 
 	visibleTextDelta := a.toolParser.Consume(textDelta)
 	if visibleTextDelta != "" {
-		if a.AllowedToolNames != nil {
-			a.deferredVisibleText += visibleTextDelta
-		} else {
-			deltaPayload := map[string]any{"content": visibleTextDelta}
-			if !a.emittedRole {
-				deltaPayload = map[string]any{"role": "assistant", "content": visibleTextDelta}
-				a.emittedRole = true
-			}
-			chunks = append(chunks, a.chunkJSON(map[string]any{
-				"choices": []map[string]any{
-					{
-						"index":         0,
-						"delta":         deltaPayload,
-						"finish_reason": nil,
-					},
-				},
-			}))
+		deltaPayload := map[string]any{"content": visibleTextDelta}
+		if !a.emittedRole {
+			deltaPayload = map[string]any{"role": "assistant", "content": visibleTextDelta}
+			a.emittedRole = true
 		}
+		chunks = append(chunks, a.chunkJSON(map[string]any{
+			"choices": []map[string]any{
+				{
+					"index":         0,
+					"delta":         deltaPayload,
+					"finish_reason": nil,
+				},
+			},
+		}))
 	}
 	logging.DebugDump(a.Logger, a.DebugEnabled, "GLM SSE 生成增量块", chunks)
 
@@ -680,12 +632,11 @@ func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) 
 	}
 
 	var chunks []string
-	finalText := a.deferredVisibleText + tailText
-	a.deferredVisibleText = ""
+	finalText := tailText
 
 	// 如果没有工具调用但延迟文本看起来像 tool_calls，尝试从中提取
 	if len(allToolCalls) == 0 && finalText != "" {
-		recoveredClean, recoveredCalls := tools.ParseToolCallsFromText(finalText, a.AllowedToolNames)
+		recoveredClean, recoveredCalls := tools.ParseToolCallsFromText(finalText)
 		if len(recoveredCalls) > 0 {
 			sanitizedRecovered := SanitizeToolCalls(recoveredCalls, a.FallbackToolURL)
 			if len(sanitizedRecovered) > 0 {
@@ -702,51 +653,6 @@ func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) 
 					a.Logger.Info("finalize: recovered tool call(s) from deferred visible text", "count", len(sanitizedRecovered))
 				}
 			}
-		}
-	}
-
-	// 注入被屏蔽工具结果作为参考文本
-	if a.blockedToolResultText != "" && len(allToolCalls) == 0 {
-		if finalText != "" {
-			finalText = "[Reference content fetched by browser]:\n" + a.blockedToolResultText + "\n\n" + finalText
-		} else {
-			finalText = "[Reference content fetched by browser]:\n" + a.blockedToolResultText
-		}
-	}
-
-	// 检查是否调用了未声明工具
-	if finalText == "" && len(allToolCalls) == 0 && a.AllowedToolNames != nil {
-		_, attemptedToolCalls := tools.ParseToolCallsFromText(strings.TrimSpace(a.cachedFullText), nil)
-		var unavailableNames []string
-		seen := map[string]bool{}
-		for _, tc := range attemptedToolCalls {
-			fn, _ := tc["function"].(map[string]any)
-			if fn == nil {
-				continue
-			}
-			name, _ := fn["name"].(string)
-			name = strings.TrimSpace(name)
-			if name != "" && !a.AllowedToolNames[name] && !seen[name] {
-				unavailableNames = append(unavailableNames, name)
-				seen[name] = true
-			}
-		}
-		sort.Strings(unavailableNames)
-		if len(unavailableNames) > 0 {
-			var allowedNames []string
-			for n := range a.AllowedToolNames {
-				allowedNames = append(allowedNames, n)
-			}
-			sort.Strings(allowedNames)
-			allowedStr := strings.Join(allowedNames, ", ")
-			if allowedStr == "" {
-				allowedStr = "(none)"
-			}
-			var quoted []string
-			for _, n := range unavailableNames {
-				quoted = append(quoted, "`"+n+"`")
-			}
-			finalText = "模型尝试调用未声明工具 " + strings.Join(quoted, ", ") + "，已阻止。本轮只允许这些工具：" + allowedStr + "。"
 		}
 	}
 
@@ -849,7 +755,7 @@ func (a *GLMEventAccumulator) BuildResponse() map[string]any {
 	if fullReasoning == "" && a.lastFullReasoning != "" {
 		fullReasoning = a.lastFullReasoning
 	}
-	cleanContent, jsonToolCalls := tools.ParseToolCallsFromText(strings.TrimSpace(fullText), a.AllowedToolNames)
+	cleanContent, jsonToolCalls := tools.ParseToolCallsFromText(strings.TrimSpace(fullText))
 	jsonToolCalls = SanitizeToolCalls(jsonToolCalls, a.FallbackToolURL)
 	if len(jsonToolCalls) == 0 {
 		jsonToolCalls = a.extractReasoningToolCalls(fullReasoning)
@@ -955,7 +861,7 @@ func (a *GLMEventAccumulator) extractReasoningToolCalls(reasoningText string) []
 	if source == "" {
 		return nil
 	}
-	_, toolCalls := tools.ParseToolCallsFromText(strings.TrimSpace(source), a.AllowedToolNames)
+	_, toolCalls := tools.ParseToolCallsFromText(strings.TrimSpace(source))
 	return SanitizeToolCalls(toolCalls, a.FallbackToolURL)
 }
 
