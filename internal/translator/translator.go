@@ -693,6 +693,7 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 								},
 							})
 						}
+
 					}
 				}
 			}
