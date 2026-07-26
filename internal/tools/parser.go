@@ -28,11 +28,17 @@ var (
 	AnyFencePattern = regexp.MustCompile("(?is)```[^\n]*\n[\\s\\S]*?```")
 	// 裸 JSON 工具调用开始
 	BareToolCallsOpenPattern = regexp.MustCompile(`(?i)\{\s*"tool_calls"\s*:`)
+	// FunctionCallsStartPattern 流式检测 [function_calls] 开始标记
+	FunctionCallsStartPattern = regexp.MustCompile(`(?i)\[function_calls\]`)
+	// FunctionCallsEndPattern 流式检测 [/function_calls] 结束标记
+	FunctionCallsEndPattern = regexp.MustCompile(`(?i)\[/function_calls\]`)
 
-	toolCodeMarker    = "```tool_code"
-	toolResultMarker  = "```tool_result"
-	fenceCloseNewline = "\n```"
-	fenceCloseBare    = "```"
+	toolCodeMarker         = "```tool_code"
+	toolResultMarker       = "```tool_result"
+	functionCallsMarker    = "[function_calls]"
+	functionCallsEndMarker = "[/function_calls]"
+	fenceCloseNewline      = "\n```"
+	fenceCloseBare         = "```"
 )
 
 var toolParserLogger = slog.Default().With("logger", "glm2api.tool_parser")
@@ -531,8 +537,8 @@ func truncateForLog(text string, maxLen int) string {
 	return text[:maxLen]
 }
 
-// FindPartialMarker 检查文本尾部是否存在部分的 ```tool_code 或 ```tool_result 标记。
-// "部分"指标记被截断，例如 "```tool_co" 或 "```tool_resu"。
+// FindPartialMarker 检查文本尾部是否存在部分的标记（```tool_code、```tool_result、[function_calls] 或 [/function_calls]）。
+// "部分"指标记被截断，例如 "```tool_co" 或 "[/function_ca"。
 // 从最长可能的标记开始，逐字符减少进行后缀匹配，返回部分标记在文本中的起始位置。
 // 找不到任何部分标记返回 -1。用于流式解析中判断是否需要等待更多数据。
 func FindPartialMarker(text string) int {
@@ -540,7 +546,7 @@ func FindPartialMarker(text string) int {
 		return -1
 	}
 	lowered := strings.ToLower(text)
-	for _, marker := range []string{toolCodeMarker, toolResultMarker} {
+	for _, marker := range []string{toolCodeMarker, toolResultMarker, functionCallsMarker, functionCallsEndMarker} {
 		maxOverlap := len(marker)
 		if len(text) < maxOverlap {
 			maxOverlap = len(text)
@@ -629,10 +635,11 @@ func (p *StreamingToolParser) IsToolCallCompleted() bool {
 
 // SplitStreamText 将文本拆分为三部分：可见文本、剩余未完成文本、和已解析的工具调用。
 // 这是流式解析的核心函数，按以下逻辑处理：
-// 1. 扫描 text 中的 ```tool_code 和 ```tool_result 标记
+// 1. 扫描 text 中的 ```tool_code、```tool_result 和 [function_calls] 标记
 // 2. tool_result 块被直接跳过（跳过整个块）
 // 3. tool_code 块：如果找到闭合标记则解析 JSON 提取工具调用；如果未闭合且 final=true 则尝试挽救
-// 4. 如果 final=false 且检测到部分标记（如 "```tool_co"），将其放入 remainder 等待更多数据
+// 4. [function_calls] 块：查找 [/function_calls] 结束标记，提取其中的 [call:name]{json}[/call] 工具调用
+// 5. 如果 final=false 且检测到部分标记（如 "```tool_co" 或 "[/function_ca"），将其放入 remainder 等待更多数据
 // 返回 (可见文本部分, 需要缓存的剩余文本, 本次解析出的工具调用列表)
 func SplitStreamText(text string, final bool) (string, string, []map[string]any) {
 	var visibleParts []string
@@ -640,9 +647,10 @@ func SplitStreamText(text string, final bool) (string, string, []map[string]any)
 	cursor := 0
 
 	for cursor < len(text) {
-		// 找到下一个 tool_code / tool_result 标记
+		// 找到下一个 tool_code / tool_result / [function_calls] 标记
 		startLoc := findFrom(cursor, text, ToolCodeStartPattern)
 		resultLoc := findFrom(cursor, text, ToolResultStartPattern)
+		fcStartLoc := findFrom(cursor, text, FunctionCallsStartPattern)
 
 		nextMarkerPos := -1
 		nextMarkerKind := ""
@@ -653,6 +661,10 @@ func SplitStreamText(text string, final bool) (string, string, []map[string]any)
 		if resultLoc != -1 && (nextMarkerPos == -1 || resultLoc < nextMarkerPos) {
 			nextMarkerPos = resultLoc
 			nextMarkerKind = "tool_result"
+		}
+		if fcStartLoc != -1 && (nextMarkerPos == -1 || fcStartLoc < nextMarkerPos) {
+			nextMarkerPos = fcStartLoc
+			nextMarkerKind = "function_calls"
 		}
 
 		if nextMarkerPos == -1 {
@@ -675,6 +687,37 @@ func SplitStreamText(text string, final bool) (string, string, []map[string]any)
 		// 输出标记前的文本
 		if nextMarkerPos > cursor {
 			visibleParts = append(visibleParts, text[cursor:nextMarkerPos])
+		}
+
+		if nextMarkerKind == "function_calls" {
+			// [function_calls] 块：查找 [/function_calls] 结束标记
+			fcEndLoc := findFrom(nextMarkerPos, text, FunctionCallsEndPattern)
+			if fcEndLoc == -1 {
+				// 不完整的 [function_calls] 块
+				if final {
+					// 最终模式：尝试从不完整块中提取工具调用
+					fcBody := text[nextMarkerPos:]
+					fcCalls := extractFunctionCallsFromText(fcBody, len(toolCalls))
+					if len(fcCalls) > 0 {
+						toolCalls = append(toolCalls, fcCalls...)
+						cursor = len(text)
+						continue
+					}
+					visibleParts = append(visibleParts, fcBody)
+					return strings.Join(visibleParts, ""), "", toolCalls
+				}
+				// 保留整个块等待更多数据
+				remainder := text[nextMarkerPos:]
+				return strings.Join(visibleParts, ""), remainder, toolCalls
+			}
+			// 完整的 [function_calls] 块
+			fcBlock := text[nextMarkerPos:fcEndLoc+len(functionCallsEndMarker)]
+			fcCalls := extractFunctionCallsFromText(fcBlock, len(toolCalls))
+			if len(fcCalls) > 0 {
+				toolCalls = append(toolCalls, fcCalls...)
+			}
+			cursor = fcEndLoc + len(functionCallsEndMarker)
+			continue
 		}
 
 		// 找到标记的结束位置
@@ -744,13 +787,92 @@ func SplitStreamText(text string, final bool) (string, string, []map[string]any)
 	return strings.Join(visibleParts, ""), "", toolCalls
 }
 
+// extractFunctionCallsFromText 从 [function_calls]...[/function_calls] 文本块中提取工具调用。
+// 解析其中的 [call:name]{json}[/call] 项，构建标准的工具调用对象。
+// startIndex 指定第一个调用的序号起点。
+// 返回解析出的工具调用列表；如果没有有效调用，返回 nil。
+func extractFunctionCallsFromText(text string, startIndex int) []map[string]any {
+	m := FunctionCallsFencePattern.FindStringSubmatch(text)
+	if m == nil {
+		return nil
+	}
+	body := m[1]
+
+	var calls []map[string]any
+	cursor := 0
+	for cursor < len(body) {
+		callStart := CallItemStartPattern.FindAllStringSubmatchIndex(body[cursor:], 1)
+		if callStart == nil {
+			break
+		}
+		nameStart := cursor + callStart[0][2]
+		nameEnd := cursor + callStart[0][3]
+		name := strings.TrimSpace(body[nameStart:nameEnd])
+		argsStartPos := cursor + callStart[0][1]
+
+		argsStr, argsEnd := ExtractCallArgsBalanced(body[argsStartPos:])
+		if argsStr == "" {
+			closeTag := strings.Index(body[argsStartPos:], "[/call]")
+			if closeTag == -1 {
+				break
+			}
+			cursor = argsStartPos + closeTag + len("[/call]")
+			continue
+		}
+
+		if name == "" {
+			cursor = argsStartPos + argsEnd
+			continue
+		}
+
+		argsDict := TryParseJSON(argsStr)
+		if argsDict == nil {
+			fixedArgs := FixCommonJsonErrors(argsStr)
+			argsDict = TryParseJSON(fixedArgs)
+		}
+		if argsDict == nil {
+			argsDict = map[string]any{}
+		}
+		argsMap, ok := argsDict.(map[string]any)
+		if !ok {
+			argsMap = map[string]any{"value": argsDict}
+		}
+
+		tc := BuildToolCall(name, argsMap, startIndex+len(calls))
+		calls = append(calls, tc)
+
+		endPos := argsStartPos + argsEnd
+		closeTagIdx := strings.Index(body[endPos:], "[/call]")
+		if closeTagIdx != -1 {
+			cursor = endPos + closeTagIdx + len("[/call]")
+		} else {
+			cursor = endPos
+		}
+	}
+	return calls
+}
+
 // SalvageIncompleteBlock 尝试从不完整的剩余文本中挽救工具调用。
 // 通常在流式响应结束时（Flush）或 final=true 的 SplitStreamText 中调用。
-// 支持两种格式的挽救：
+// 支持三种格式的挽救：
 // 1. 有 ```tool_code 开始标记但没有闭合标记的块：提取标记后的 JSON
-// 2. 裸 JSON 对象（无代码块包裹）
+// 2. 有 [function_calls] 开始标记但没有 [/function_calls] 结束标记的块：提取 [call:name]{json}[/call]
+// 3. 裸 JSON 对象（无代码块包裹）
 // 返回挽救出的工具调用列表，如果无法挽救返回 nil。
 func SalvageIncompleteBlock(text string, existingToolCalls []map[string]any) []map[string]any {
+	// 先尝试 [function_calls] 格式
+	fcLoc := FunctionCallsStartPattern.FindStringIndex(text)
+	if fcLoc != nil {
+		fcBody := text[fcLoc[0]:]
+		fcCalls := extractFunctionCallsFromText(fcBody, len(existingToolCalls))
+		if len(fcCalls) > 0 {
+			existingToolCalls = append(existingToolCalls, fcCalls...)
+			toolParserLogger.Debug("Salvaged tool call(s) from incomplete [function_calls] remainder", "count", len(fcCalls))
+			return fcCalls
+		}
+	}
+
+	// 再尝试 ```tool_code 格式
 	loc := ToolCodeStartPattern.FindStringIndex(text)
 	if loc == nil {
 		// 也许是一个裸 JSON 对象
