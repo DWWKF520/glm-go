@@ -40,29 +40,6 @@ func NormalizeToolName(name any) string {
 	return strings.TrimSpace(fmt.Sprintf("%v", name))
 }
 
-// FilterTools 过滤工具列表
-func FilterTools(tools []map[string]any) []map[string]any {
-	if len(tools) == 0 {
-		return nil
-	}
-	filtered := []map[string]any{}
-	for _, tool := range tools {
-		fn, _ := tool["function"].(map[string]any)
-		if fn == nil {
-			continue
-		}
-		toolName := NormalizeToolName(fn["name"])
-		if toolName == "" {
-			continue
-		}
-		filtered = append(filtered, tool)
-	}
-	if len(filtered) == 0 {
-		return nil
-	}
-	return filtered
-}
-
 var safeParamNameRE = regexp.MustCompile(`[^a-zA-Z0-9_.:-]`)
 
 func safeParameterName(value any) string {

@@ -1,5 +1,24 @@
 package glmclient
 
+// client.go — GLM Web 客户端核心实现
+//
+// 本文件实现了与 GLM (ChatGLM) Web API 交互的完整客户端，包括：
+//   - 并发请求队列（ConcurrentRequestQueue）：控制同时向 GLM 发送的请求数量，避免触发限流
+//   - 多账号故障转移（callWithAccountFailover）：支持多个 GLM 账号轮换使用，单个账号失败时自动切换
+//   - 流式聊天补全（StreamChatCompletion）：将 OpenAI 格式的 chat 请求转换为 GLM 格式并转发
+//   - 图片生成（GenerateImages）：将 OpenAI 格式的 image 请求转发到 GLM 的 cogview 绘图接口
+//   - 文件上传（uploadReferencedFiles）：自动上传消息中的图片和文件附件到 GLM
+//   - SSE 流解析（iterSSEEvents）：解析 GLM 返回的 Server-Sent Events 流
+//   - 错误处理与重试：包括忙碌重试、游客账号重试、错误事件过滤等
+//
+// 数据流向：
+//   OpenAI API 请求 → StreamChatCompletion / GenerateImages
+//     → resolveTools（过滤工具）
+//     → openChatStream / openImageStream（构建 GLM 请求并通过账号故障转移发送）
+//     → iterSSEEvents（解析 SSE 流）
+//     → GLMEventAccumulator（累积事件，转换为 OpenAI 格式的 SSE chunks）
+//     → 返回给调用方
+
 import (
 	"bufio"
 	"bytes"
@@ -31,10 +50,12 @@ import (
 	"glm2api/internal/translator"
 )
 
+// FileSizeLimit 文件上传大小限制（100MB）
 const (
 	FileSizeLimit = 100 * 1024 * 1024
 )
 
+// imageSizeToAspectRatio 将 OpenAI 格式的图片尺寸映射为 GLM cogview 使用的宽高比字符串
 var imageSizeToAspectRatio = map[string]string{
 	"1024x1024": "1:1",
 	"1024x1536": "2:3",
@@ -43,26 +64,30 @@ var imageSizeToAspectRatio = map[string]string{
 	"1792x1024": "16:9",
 }
 
+// sizePattern 匹配 "宽x高" 格式的图片尺寸字符串（如 "1024x1024"）
 var sizePattern = regexp.MustCompile(`^\d+x\d+$`)
 
-// UpstreamAPIError 上游 API 错误
+// UpstreamAPIError 上游 API 错误，别名自 auth.UpstreamError
 type UpstreamAPIError = auth.UpstreamError
 
-// QueueTimeoutError 队列超时错误
+// QueueTimeoutError 队列等待超时错误
+// 当请求在并发队列中等待时间超过配置的 GLM_QUEUE_WAIT_TIMEOUT_SECONDS 时返回
 type QueueTimeoutError struct {
 	msg string
 }
 
+// Error 实现 error 接口
 func (e *QueueTimeoutError) Error() string { return e.msg }
 
-// QueueLease 队列租约
+// QueueLease 队列租约，代表一个请求占用了队列中的一个执行槽位
+// 使用租约模式确保请求完成后正确释放槽位
 type QueueLease struct {
-	ticket          int
-	releaseCallback func(int)
-	released        bool
+	ticket          int             // 分配的票据号（递增整数）
+	releaseCallback func(int)       // 释放时的回调函数
+	released        bool            // 是否已释放（防止重复释放）
 }
 
-// Release 释放租约
+// Release 释放租约，将执行槽位归还给队列
 func (l *QueueLease) Release() {
 	if l.released {
 		return
@@ -72,17 +97,27 @@ func (l *QueueLease) Release() {
 }
 
 // ConcurrentRequestQueue 并发请求队列
+// 通过票据机制控制同时向 GLM 发送的请求数量，实现请求排队和限流
+//
+// 原理：
+//   - 每个请求获取一个递增的 ticket（票据号）
+//   - 只有当 ticket - servingTicket < maxConcurrency 时，请求才能执行
+//   - 请求完成后通过 release 释放槽位，servingTicket 前进
+//   - 超过 waitTimeout 仍未获得槽位的请求返回 QueueTimeoutError
 type ConcurrentRequestQueue struct {
-	logger          *slog.Logger
-	waitTimeout     time.Duration
-	maxConcurrency  int
-	mu              *sync.Cond
-	nextTicket      int
-	servingTicket   int
-	releasedTickets map[int]bool
+	logger          *slog.Logger       // 日志记录器
+	waitTimeout     time.Duration      // 最大等待超时时间
+	maxConcurrency  int                // 最大并发数（GLM 同时处理的对话数）
+	mu              *sync.Cond         // 条件变量，用于请求等待/唤醒
+	nextTicket      int                // 下一个将分配的票据号
+	servingTicket   int                // 当前正在服务的最小票据号
+	releasedTickets map[int]bool       // 已释放但尚未推进 servingTicket 的票据
 }
 
 // NewConcurrentRequestQueue 创建并发请求队列
+// logger: 日志记录器
+// waitTimeout: 请求最大等待时间
+// maxConcurrency: 最大并发执行数
 func NewConcurrentRequestQueue(logger *slog.Logger, waitTimeout time.Duration, maxConcurrency int) *ConcurrentRequestQueue {
 	if maxConcurrency < 1 {
 		maxConcurrency = 1
@@ -102,13 +137,18 @@ func (q *ConcurrentRequestQueue) MaxConcurrency() int {
 	return q.maxConcurrency
 }
 
-// Acquire 获取队列租约
+// Acquire 获取队列租约，阻塞直到获得执行槽位或超时
+// requestName: 请求描述（用于日志）
+// 返回值：
+//   - *QueueLease: 租约对象，使用完毕后必须调用 Release()
+//   - error: 超时返回 *QueueTimeoutError
 func (q *ConcurrentRequestQueue) Acquire(requestName string) (*QueueLease, error) {
 	q.mu.L.Lock()
 	defer q.mu.L.Unlock()
 
 	ticket := q.nextTicket
 	q.nextTicket++
+	// 计算队列前方等待的请求数量
 	queueAhead := ticket - (q.servingTicket + q.maxConcurrency) + 1
 	if queueAhead < 0 {
 		queueAhead = 0
@@ -119,6 +159,7 @@ func (q *ConcurrentRequestQueue) Acquire(requestName string) (*QueueLease, error
 		q.logger.Info("请求进入 GLM 队列", "ticket", ticket, "ahead", queueAhead, "request", requestName)
 	}
 
+	// 等待直到 ticket 落入并发窗口内
 	for ticket >= q.servingTicket+q.maxConcurrency {
 		remaining := q.waitTimeout - time.Since(start)
 		if remaining <= 0 {
@@ -126,12 +167,12 @@ func (q *ConcurrentRequestQueue) Acquire(requestName string) (*QueueLease, error
 				msg: fmt.Sprintf("GLM 队列等待超时，前方仍有 %d 个请求，请稍后重试。", ticket-(q.servingTicket+q.maxConcurrency)+1),
 			}
 		}
-		// sync.Cond 不支持带超时的 Wait，使用 goroutine + 定时器
+		// sync.Cond 不支持带超时的 Wait，使用 goroutine + 定时器模拟
 		done := make(chan struct{})
 		go func() {
 			time.Sleep(remaining)
 			close(done)
-			q.mu.Broadcast()
+			q.mu.Broadcast() // 超时后唤醒所有等待者
 		}()
 		q.mu.Wait()
 		select {
@@ -145,28 +186,33 @@ func (q *ConcurrentRequestQueue) Acquire(requestName string) (*QueueLease, error
 	return &QueueLease{ticket: ticket, releaseCallback: q.release}, nil
 }
 
+// release 释放指定票据对应的执行槽位
+// 通过遍历已释放票据，推进 servingTicket 到下一个连续未释放的位置
 func (q *ConcurrentRequestQueue) release(ticket int) {
 	q.mu.L.Lock()
 	defer q.mu.L.Unlock()
 	q.releasedTickets[ticket] = true
+	// 推进 servingTicket：跳过所有已释放的连续票据
 	for q.releasedTickets[q.servingTicket] {
 		delete(q.releasedTickets, q.servingTicket)
 		q.servingTicket++
 	}
 	q.logger.Info("请求离开 GLM 执行槽位", "ticket", ticket)
-	q.mu.Broadcast()
+	q.mu.Broadcast() // 唤醒等待中的请求
 }
 
 // Client GLM Web 客户端
+// 封装了与 GLM Web API 交互的所有逻辑，包括认证、请求发送、响应解析、账号故障转移等
 type Client struct {
-	config       *config.AppConfig
-	logger       *slog.Logger
-	Auth         *auth.Manager
-	RequestQueue *ConcurrentRequestQueue
-	httpClient   *http.Client
+	config       *config.AppConfig           // 应用配置
+	logger       *slog.Logger                // 日志记录器
+	Auth         *auth.Manager               // 认证管理器（管理多个账号的 access token）
+	RequestQueue *ConcurrentRequestQueue     // 并发请求队列
+	httpClient   *http.Client                // HTTP 客户端（带超时）
 }
 
 // NewClient 创建 GLM 客户端
+// 初始化认证管理器、并发请求队列和 HTTP 客户端
 func NewClient(cfg *config.AppConfig, logger *slog.Logger) *Client {
 	if logger == nil {
 		logger = logging.GetLogger("glm2api.client")
@@ -187,10 +233,17 @@ func NewClient(cfg *config.AppConfig, logger *slog.Logger) *Client {
 }
 
 // StreamChatCompletion 流式聊天补全
-// 返回一个 channel，持续输出 SSE chunks ([]byte)
+// 将 OpenAI 格式的 chat completion 请求转发到 GLM Web API，以 SSE 流式返回结果
+//
+// 流程：
+//  1. 从请求中提取并过滤工具定义
+//  2. 从并发队列获取执行槽位（租约）
+//  3. 打开与 GLM 的流式连接
+//  4. 在 goroutine 中持续读取 SSE 事件，通过 accumulator 转换为 OpenAI 格式
+//  5. 完成后删除 GLM 会话并释放队列槽位
+//
+// 返回值：一个 channel，持续输出 SSE 格式的 []byte chunks
 func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]any) (<-chan []byte, error) {
-	filteredTools := c.resolveTools(payload)
-	_ = filteredTools
 	lease, err := c.RequestQueue.Acquire(fmt.Sprintf("stream:%v", payload["model"]))
 	if err != nil {
 		return nil, err
@@ -223,6 +276,7 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 			if event == nil {
 				continue
 			}
+			// 检查事件中是否有错误 part，尝试过滤掉错误部分后继续处理
 			if err := c.raiseForEventError(event, true); err != nil {
 				cleaned := c.filterErrorParts(event)
 				if len(cleaned) > 0 {
@@ -234,10 +288,12 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 					continue
 				}
 			}
+			// 将 GLM 事件转换为 OpenAI 格式的 SSE chunks
 			chunks, status := accumulator.ConsumeEvent(event)
 			for _, chunk := range chunks {
 				out <- []byte(chunk)
 			}
+			// 收到终止状态（finish/intervene/tool_call_complete）时，执行收尾并结束
 			if status == "finish" || status == "intervene" || status == "tool_call_complete" {
 				lastError, _ := event["last_error"].(map[string]any)
 				for _, chunk := range accumulator.Finalize(status, lastError) {
@@ -246,6 +302,7 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 				return
 			}
 		}
+		// 流正常结束（未收到 finish 状态），执行收尾
 		for _, chunk := range accumulator.Finalize("stop", nil) {
 			out <- []byte(chunk)
 		}
@@ -255,6 +312,13 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 }
 
 // GenerateImages 生成图片
+// 将 OpenAI 格式的 image generation 请求转发到 GLM 的 cogview 绘图接口
+//
+// 流程：
+//  1. 获取队列槽位
+//  2. 打开图片生成流
+//  3. 读取所有事件直到 finish
+//  4. 从累积器中提取图片 URL 并构建响应
 func (c *Client) GenerateImages(ctx context.Context, payload map[string]any) (map[string]any, error) {
 	lease, err := c.RequestQueue.Acquire(fmt.Sprintf("image:%v", payload["model"]))
 	if err != nil {
@@ -295,7 +359,8 @@ func (c *Client) GenerateImages(ctx context.Context, payload map[string]any) (ma
 	return c.buildImagesResponse(payload, finalEvent, accumulator)
 }
 
-// DeleteConversation 删除会话
+// DeleteConversation 删除 GLM 会话
+// 在请求完成后清理 GLM 端的会话数据，避免占用 GLM 的会话配额
 func (c *Client) DeleteConversation(ctx context.Context, conversationID, assistantID string) {
 	if !c.config.GLMDeleteConversation {
 		return
@@ -358,24 +423,34 @@ func (c *Client) DeleteConversation(ctx context.Context, conversationID, assista
 	c.logger.Info("已删除 GLM 会话", "conversation_id", conversationID, "assistant_id", actualAssistantID)
 }
 
+// resolveTools 从 OpenAI 请求 payload 中提取工具定义列表
 func (c *Client) resolveTools(openaiPayload map[string]any) []map[string]any {
 	var rawTools []map[string]any
-	if tools, ok := openaiPayload["tools"].([]any); ok {
-		for _, t := range tools {
-			if m, ok := t.(map[string]any); ok {
+	if t, ok := openaiPayload["tools"].([]any); ok {
+		for _, item := range t {
+			if m, ok := item.(map[string]any); ok {
 				rawTools = append(rawTools, m)
 			}
 		}
 	}
-	filteredTools := tools.FilterTools(rawTools)
-	return filteredTools
+	return rawTools
 }
 
+// openChatStream 打开与 GLM 的流式聊天连接
+// 构建 GLM 格式的请求体，通过账号故障转移机制发送请求，返回 HTTP 响应流
+//
+// 核心步骤：
+//  1. 从 OpenAI payload 中解析工具定义
+//  2. 调用 ConvertMessages 将 OpenAI 消息格式转换为 GLM 格式
+//  3. 上传消息中引用的图片和文件附件
+//  4. 构建 GLM 请求体（含 meta_data、chat_mode 等）
+//  5. 通过 callWithAccountFailover 发送请求，自动处理忙碌重试
 func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]any, preferredAccountIndex *int) (*http.Response, string, error) {
 	upstreamModel := openaiPayload["model"].(string)
 	assistantID := c.config.GLMAssistantID
 	filteredTools := c.resolveTools(openaiPayload)
 
+	// 将 OpenAI 消息格式转换为 GLM 能理解的文本提示词格式
 	convertedMessages := translator.ConvertMessages(
 		getMessagesList(openaiPayload),
 		filteredTools,
@@ -386,6 +461,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "OpenAI 原始 chat 请求 payload", openaiPayload)
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "转换后的 GLM messages", convertedMessages)
 
+	// 上传消息中引用的图片和文件，并将上传结果附加到消息中
 	refs := c.uploadReferencedFiles(ctx, getMessagesList(openaiPayload))
 	if len(refs) > 0 {
 		if len(convertedMessages) > 0 {
@@ -393,6 +469,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 			for i, item := range contentList {
 				if t, _ := item["type"].(string); t == "text" {
 					if text, _ := item["text"].(string); text != "" {
+						// 清理文本中的图片引用标记（已通过上传方式传递）
 						cleaned := translator.ImageRefRE.ReplaceAllString(text, "")
 						cleaned = strings.TrimSpace(cleaned)
 						contentList[i]["text"] = cleaned
@@ -404,6 +481,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 		}
 	}
 
+	// 构建 GLM API 请求体
 	requestBody := map[string]any{
 		"assistant_id":    assistantID,
 		"conversation_id": "",
@@ -412,7 +490,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 		"messages":        convertedMessages,
 		"meta_data": map[string]any{
 			"channel":             "",
-			"chat_mode":           "thinking",
+			"chat_mode":           "thinking",  // 启用思考模式
 			"draft_id":            "",
 			"if_plus_model":       true,
 			"input_question_type": "xxxx",
@@ -428,6 +506,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 	c.logger.Info("转发请求", "upstream", upstreamModel, "stream", openaiPayload["stream"])
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "转发到 GLM 的 chat 原始请求体", bodyBytes)
 
+	// 定义请求操作（支持忙碌重试）
 	operation := func(accountIndex int, accessToken string) (any, error) {
 		var lastErr error
 		for attempt := 0; attempt <= c.config.GLMBusyMaxRetries; attempt++ {
@@ -436,6 +515,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 			if err != nil {
 				return nil, err
 			}
+			// 设置 GLM Web API 所需的认证和设备标识头
 			headers := c.Auth.GetBrowserHeaders("")
 			headers["Authorization"] = "Bearer " + accessToken
 			headers["X-Device-Id"] = uuid.New().String()
@@ -452,7 +532,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 				return nil, err
 			}
 
-			// 检查是否需要重试
+			// HTTP 429 表示 GLM 正在处理其他对话，需要等待重试
 			if resp.StatusCode == 429 {
 				errorPayload := c.readErrorPayload(resp)
 				if c.shouldRetryBusyError(resp.StatusCode, errorPayload) && attempt < c.config.GLMBusyMaxRetries {
@@ -472,6 +552,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 				return nil, &UpstreamAPIError{StatusCode: resp.StatusCode, Message: message, Payload: errorPayload}
 			}
 
+			// 其他 4xx/5xx 错误直接返回
 			if resp.StatusCode >= 400 {
 				errorPayload := c.readErrorPayload(resp)
 				resp.Body.Close()
@@ -479,7 +560,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 				return nil, &UpstreamAPIError{StatusCode: resp.StatusCode, Message: message, Payload: errorPayload}
 			}
 
-			// 检查内容类型决定是否需要预处理
+			// 根据响应 Content-Type 决定是流式还是非流式处理
 			preparedResp, err := c.prepareChatResponse(resp)
 			if err != nil {
 				return nil, err
@@ -503,6 +584,8 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 	return resp, assistantID, nil
 }
 
+// openImageStream 打开与 GLM 的图片生成连接
+// 构建 cogview 绘图请求并通过账号故障转移发送
 func (c *Client) openImageStream(ctx context.Context, payload map[string]any, preferredAccountIndex *int) (*http.Response, string, error) {
 	prompt, _ := payload["prompt"].(string)
 	prompt = strings.TrimSpace(prompt)
@@ -510,6 +593,7 @@ func (c *Client) openImageStream(ctx context.Context, payload map[string]any, pr
 		return nil, "", &UpstreamAPIError{StatusCode: 400, Message: "图片生成请求缺少 prompt"}
 	}
 
+	// 解析图片尺寸并转换为宽高比
 	size, _ := payload["size"].(string)
 	if size == "" {
 		size = "1024x1024"
@@ -522,6 +606,7 @@ func (c *Client) openImageStream(ctx context.Context, payload map[string]any, pr
 		userModel = c.config.GLMImageModelName
 	}
 
+	// 构建 GLM 图片生成请求体
 	requestBody := map[string]any{
 		"assistant_id":    c.config.GLMImageAssistantID,
 		"conversation_id": "",
@@ -600,6 +685,10 @@ func (c *Client) openImageStream(ctx context.Context, payload map[string]any, pr
 	return resp, c.config.GLMImageAssistantID, nil
 }
 
+// prepareChatResponse 预处理 GLM 聊天响应
+// 根据 Content-Type 区分处理：
+//   - application/json: 非流式响应，检查状态码后重新包装为标准 HTTP 响应
+//   - 其他（text/event-stream）: 流式响应，处理 gzip 解压后返回
 func (c *Client) prepareChatResponse(resp *http.Response) (*http.Response, error) {
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	if strings.Contains(contentType, "application/json") {
@@ -612,6 +701,7 @@ func (c *Client) prepareChatResponse(resp *http.Response) (*http.Response, error
 		status := getAny(payload, "status")
 		message, _ := payload["message"].(string)
 		message = strings.TrimSpace(message)
+		// status 非 0 或 message 非空表示 GLM 返回了业务错误
 		if (status != nil && status != 0) || message != "" {
 			return nil, &UpstreamAPIError{
 				StatusCode: 502,
@@ -619,8 +709,8 @@ func (c *Client) prepareChatResponse(resp *http.Response) (*http.Response, error
 				Payload:    payload,
 			}
 		}
+		// 将 JSON 响应体重新包装为 HTTP 响应（供 SSE 解析器统一处理）
 		bodyBytes, _ := sonic.Marshal(payload)
-		// 创建新响应
 		newResp := &http.Response{
 			Status:     "200 OK",
 			StatusCode: 200,
@@ -629,15 +719,18 @@ func (c *Client) prepareChatResponse(resp *http.Response) (*http.Response, error
 		}
 		return newResp, nil
 	}
+	// 流式响应：处理 gzip 解压
 	return c.wrapStreamResponse(resp), nil
 }
 
+// wrapStreamResponse 处理 gzip 压缩的流式响应
+// 如果响应体使用 gzip 编码，则用 gzip.NewReader 包装 body 以透明解压
 func (c *Client) wrapStreamResponse(resp *http.Response) *http.Response {
 	contentEncoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
 	if contentEncoding == "gzip" {
 		gr, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			return resp
+			return resp // 解压失败时返回原始响应
 		}
 		newResp := &http.Response{
 			Status:     resp.Status,
@@ -650,6 +743,12 @@ func (c *Client) wrapStreamResponse(resp *http.Response) *http.Response {
 	return resp
 }
 
+// buildImagesResponse 构建图片生成的 OpenAI 格式响应
+// 从 GLM accumulator 中提取生成的图片，构建符合 OpenAI Images API 规范的响应体
+//
+// 支持两种响应格式：
+//   - "url": 返回图片的直接 URL
+//   - "b64_json": 下载图片并转换为 base64 编码
 func (c *Client) buildImagesResponse(requestPayload map[string]any, finalEvent map[string]any, accumulator *translator.GLMEventAccumulator) (map[string]any, error) {
 	requestedCount := coercePositiveInt(requestPayload["n"], 1, 10)
 	responseFormat, _ := requestPayload["response_format"].(string)
@@ -660,7 +759,6 @@ func (c *Client) buildImagesResponse(requestPayload map[string]any, finalEvent m
 	created := time.Now().Unix()
 
 	var data []map[string]any
-	// 通过反射访问 accumulator 内部
 	orderedParts := accumulator.GetOrderedParts()
 
 	for _, part := range orderedParts {
@@ -735,6 +833,8 @@ func (c *Client) buildImagesResponse(requestPayload map[string]any, finalEvent m
 	}, nil
 }
 
+// resolveAspectRatio 将 OpenAI 格式的尺寸字符串解析为 GLM cogview 使用的宽高比
+// 支持预定义尺寸（如 "1024x1024" → "1:1"）和自定义 WxH 格式
 func (c *Client) resolveAspectRatio(size string) string {
 	normalized := strings.ToLower(strings.TrimSpace(size))
 	if ar, ok := imageSizeToAspectRatio[normalized]; ok {
@@ -755,6 +855,7 @@ func (c *Client) resolveAspectRatio(size string) string {
 	return "1:1"
 }
 
+// resolveImageStyle 从 payload 中提取图片风格参数
 func (c *Client) resolveImageStyle(payload map[string]any) string {
 	style, _ := payload["style"].(string)
 	style = strings.ToLower(strings.TrimSpace(style))
@@ -764,6 +865,7 @@ func (c *Client) resolveImageStyle(payload map[string]any) string {
 	return style
 }
 
+// resolveImageScene 从 payload 中提取图片场景参数
 func (c *Client) resolveImageScene(payload map[string]any) string {
 	scene, _ := payload["scene"].(string)
 	scene = strings.ToLower(strings.TrimSpace(scene))
@@ -773,6 +875,8 @@ func (c *Client) resolveImageScene(payload map[string]any) string {
 	return scene
 }
 
+// downloadImageAsBase64 下载图片并转换为 base64 编码字符串
+// 用于 OpenAI Images API 的 b64_json 响应格式
 func (c *Client) downloadImageAsBase64(imageURL string) (string, error) {
 	resp, err := c.httpClient.Get(imageURL)
 	if err != nil {
@@ -786,13 +890,20 @@ func (c *Client) downloadImageAsBase64(imageURL string) (string, error) {
 	return base64.StdEncoding.EncodeToString(data), nil
 }
 
-// iterSSEEvents 迭代 SSE 事件
+// iterSSEEvents 解析 GLM 返回的 SSE（Server-Sent Events）流
+// 返回一个 channel，持续输出解析后的 JSON 事件对象
+//
+// SSE 解析逻辑：
+//   - 以 "\n\n" 作为事件分隔符
+//   - 提取 "data:" 前缀后的内容作为 JSON payload
+//   - "[DONE]" 标记表示流结束（不发送到 channel）
+//   - 无法解析的 JSON 片段被静默忽略
 func (c *Client) iterSSEEvents(body io.Reader) <-chan map[string]any {
 	out := make(chan map[string]any, 32)
 	go func() {
 		defer close(out)
 		scanner := bufio.NewScanner(body)
-		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024) // 增大缓冲区以处理大型事件
 		var pending strings.Builder
 
 		emitBlock := func(block string) {
@@ -800,6 +911,7 @@ func (c *Client) iterSSEEvents(body io.Reader) <-chan map[string]any {
 			if block == "" {
 				return
 			}
+			// 查找 "data:" 前缀，SSE 规范要求每个事件以 "data:" 开头
 			dataStart := strings.Index(block, "data:")
 			if dataStart == -1 {
 				return
@@ -810,7 +922,7 @@ func (c *Client) iterSSEEvents(body io.Reader) <-chan map[string]any {
 			}
 			logging.DebugDump(c.logger, c.config.DebugDumpAll, "GLM 原始 SSE block", block)
 			if payload == "[DONE]" {
-				return
+				return // 流结束标记，不发送
 			}
 			var parsed map[string]any
 			if err := sonic.UnmarshalString(payload, &parsed); err != nil {
@@ -821,6 +933,7 @@ func (c *Client) iterSSEEvents(body io.Reader) <-chan map[string]any {
 			out <- parsed
 		}
 
+		// 逐行读取，累积到 pending 缓冲区，直到遇到空行（事件分隔符）
 		for scanner.Scan() {
 			line := scanner.Text()
 			pending.WriteString(line)
@@ -838,7 +951,7 @@ func (c *Client) iterSSEEvents(body io.Reader) <-chan map[string]any {
 				emitBlock(block)
 			}
 		}
-		// 处理剩余
+		// 处理流中剩余的不完整事件
 		if pending.Len() > 0 {
 			emitBlock(pending.String())
 		}
@@ -846,6 +959,8 @@ func (c *Client) iterSSEEvents(body io.Reader) <-chan map[string]any {
 	return out
 }
 
+// uploadReferencedFiles 扫描消息列表中的图片和文件引用，上传到 GLM 并返回 GLM 格式的附件引用
+// OpenAI 格式的消息中通过 image_url 和 file 类型的 content parts 引用附件
 func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[string]any) []map[string]any {
 	var refs []map[string]any
 	imageOrder := 0
@@ -891,6 +1006,14 @@ func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[strin
 	return refs
 }
 
+// uploadFileReference 上传单个文件到 GLM 文件服务
+// 支持图片和普通文件两种类型，返回 GLM 格式的附件引用对象
+//
+// 流程：
+//  1. 通过 fetchFilePayload 获取文件内容（支持 data: URL 和远程 URL）
+//  2. 构建 multipart/form-data 请求体
+//  3. 通过账号故障转移机制发送上传请求
+//  4. 解析响应，构建 GLM 格式的附件引用
 func (c *Client) uploadFileReference(ctx context.Context, fileURL string, isImage bool, order int) map[string]any {
 	filename, mimeType, payload, err := c.fetchFilePayload(fileURL)
 	if err != nil {
@@ -898,6 +1021,7 @@ func (c *Client) uploadFileReference(ctx context.Context, fileURL string, isImag
 		return nil
 	}
 
+	// 构建 multipart/form-data 请求体
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	part, err := writer.CreateFormFile("file", filename)
@@ -963,6 +1087,7 @@ func (c *Client) uploadFileReference(ctx context.Context, fileURL string, isImag
 		return nil
 	}
 
+	// 根据文件类型构建不同的引用格式
 	if isImage {
 		fileName, _ := result["file_name"].(string)
 		if fileName == "" {
@@ -1014,7 +1139,14 @@ func (c *Client) uploadFileReference(ctx context.Context, fileURL string, isImag
 	}
 }
 
+// fetchFilePayload 从 URL 或 data: URI 获取文件内容
+// 支持两种来源：
+//   - data: URI（如 data:image/png;base64,...）：直接解码 base64 内容
+//   - 远程 URL：通过 HTTP GET 下载
+//
+// 返回值：(文件名, MIME 类型, 文件内容, 错误)
 func (c *Client) fetchFilePayload(fileURL string) (string, string, []byte, error) {
+	// 处理 data: URI 格式
 	if strings.HasPrefix(fileURL, "data:") {
 		commaIdx := strings.Index(fileURL, ",")
 		if commaIdx == -1 {
@@ -1044,6 +1176,7 @@ func (c *Client) fetchFilePayload(fileURL string) (string, string, []byte, error
 		return filename, mimeType, payload, nil
 	}
 
+	// 处理远程 URL
 	parsed, err := url.Parse(fileURL)
 	if err != nil {
 		return "", "", nil, err
@@ -1072,6 +1205,8 @@ func (c *Client) fetchFilePayload(fileURL string) (string, string, []byte, error
 	return filename, mimeType, payload, nil
 }
 
+// readErrorPayload 读取 HTTP 错误响应体并尝试解析为 JSON
+// 支持 gzip 压缩的响应体
 func (c *Client) readErrorPayload(resp *http.Response) map[string]any {
 	defer resp.Body.Close()
 	var reader io.Reader = resp.Body
@@ -1095,6 +1230,9 @@ func (c *Client) readErrorPayload(resp *http.Response) map[string]any {
 	return map[string]any{"message": text}
 }
 
+// shouldRetryBusyError 判断是否为可重试的忙碌错误
+// GLM 返回 HTTP 429 时，如果内层 status 为 10061 或 message 包含"请等待其他对话生成完毕"，
+// 则表示 GLM 正忙，应等待后重试
 func (c *Client) shouldRetryBusyError(statusCode int, payload map[string]any) bool {
 	if statusCode != 429 {
 		return false
@@ -1104,6 +1242,8 @@ func (c *Client) shouldRetryBusyError(statusCode int, payload map[string]any) bo
 	return (innerStatus != nil && innerStatus == 10061) || strings.Contains(message, "请等待其他对话生成完毕")
 }
 
+// buildErrorMessage 构建人类可读的错误消息
+// 组合 HTTP 状态码、GLM 内层状态码、错误消息和请求 ID
 func (c *Client) buildErrorMessage(statusCode int, payload map[string]any) string {
 	message, _ := payload["message"].(string)
 	message = strings.TrimSpace(message)
@@ -1123,6 +1263,9 @@ func (c *Client) buildErrorMessage(statusCode int, payload map[string]any) strin
 	return strings.Join(parts, " | ")
 }
 
+// raiseForEventError 检查 SSE 事件是否包含错误
+// 从事件的 status、last_error 和 parts 中提取错误信息
+// 返回 nil 表示无错误，返回 *UpstreamAPIError 表示有错误
 func (c *Client) raiseForEventError(event map[string]any, stream bool) error {
 	status, _ := event["status"].(string)
 	statusLower := strings.ToLower(strings.TrimSpace(status))
@@ -1175,6 +1318,8 @@ func (c *Client) raiseForEventError(event map[string]any, stream bool) error {
 	}
 }
 
+// extractEventError 从事件的 parts 中提取错误信息
+// 遍历所有 part，查找包含 error 对象或 status 为 "error" 的 part
 func (c *Client) extractEventError(event map[string]any) map[string]any {
 	parts, ok := event["parts"].([]any)
 	if !ok {
@@ -1196,6 +1341,8 @@ func (c *Client) extractEventError(event map[string]any) map[string]any {
 	return nil
 }
 
+// filterErrorParts 过滤掉事件中包含错误的 parts
+// 返回只包含正常 parts 的切片，供后续处理继续使用
 func (c *Client) filterErrorParts(event map[string]any) []any {
 	parts, ok := event["parts"].([]any)
 	if !ok {
@@ -1219,6 +1366,8 @@ func (c *Client) filterErrorParts(event map[string]any) []any {
 	return cleaned
 }
 
+// getPreferredAccountIndex 根据票据号计算首选账号索引
+// 通过 ticket % accountCount 实现账号的均匀分配
 func (c *Client) getPreferredAccountIndex(ticket int) *int {
 	count := c.Auth.GetAccountCount()
 	if count <= 0 {
@@ -1228,9 +1377,20 @@ func (c *Client) getPreferredAccountIndex(ticket int) *int {
 	return &idx
 }
 
-// callWithAccountFailover 使用账号失败转移执行操作
+// operationFunc 账号操作函数类型
+// 参数：(账号索引, access token)
+// 返回：(操作结果, 错误)
 type operationFunc func(accountIndex int, accessToken string) (any, error)
 
+// callWithAccountFailover 使用账号失败转移机制执行操作
+// 当一个账号的请求失败时，自动切换到下一个账号重试
+//
+// 故障转移策略：
+//   1. 从首选账号（或当前账号）开始
+//   2. 如果获取 access token 失败且需要切换账号，则跳到下一个账号
+//   3. 如果操作执行失败且需要切换账号，则跳到下一个账号
+//   4. 游客账号支持额外的重试次数（GLMGuestMaxRetries）
+//   5. 所有账号都失败后，重置账号轮换状态并返回最后一个错误
 func (c *Client) callWithAccountFailover(ctx context.Context, requestName string, operation operationFunc, preferredAccountIndex *int) (any, error) {
 	accountCount := c.Auth.GetAccountCount()
 	if accountCount <= 0 {
@@ -1245,6 +1405,7 @@ func (c *Client) callWithAccountFailover(ctx context.Context, requestName string
 	var lastErr error
 	for offset := 0; offset < accountCount; offset++ {
 		accountIndex := (startIndex + offset) % accountCount
+		// 游客账号有额外的重试机会（因为游客 token 可能过期需要刷新）
 		guestRetryLimit := 0
 		if c.Auth.IsGuestAccount(accountIndex) {
 			guestRetryLimit = c.config.GLMGuestMaxRetries
@@ -1266,6 +1427,7 @@ func (c *Client) callWithAccountFailover(ctx context.Context, requestName string
 				if !shouldSwitch || accountCount == 1 {
 					return nil, err
 				}
+				// 切换到下一个账号
 				c.Auth.AdvanceAccount(accountIndex, fmt.Sprintf("%s: %v", requestName, err))
 				break
 			}
@@ -1286,6 +1448,7 @@ func (c *Client) callWithAccountFailover(ctx context.Context, requestName string
 				if !shouldSwitch || accountCount == 1 {
 					return nil, err
 				}
+				// 切换到下一个账号
 				c.Auth.AdvanceAccount(accountIndex, fmt.Sprintf("%s: %v", requestName, err))
 				break
 			}
@@ -1300,7 +1463,10 @@ func (c *Client) callWithAccountFailover(ctx context.Context, requestName string
 	return nil, fmt.Errorf("账号轮换失败：%s", requestName)
 }
 
-// 辅助函数
+// --- 辅助函数 ---
+
+// getMessagesList 从 OpenAI payload 中提取 messages 列表
+// payload["messages"] 是 []any 类型，需要转换为 []map[string]any
 func getMessagesList(payload map[string]any) []map[string]any {
 	messages, ok := payload["messages"].([]any)
 	if !ok {
@@ -1315,6 +1481,7 @@ func getMessagesList(payload map[string]any) []map[string]any {
 	return result
 }
 
+// getModelName 从 payload 中获取模型名称，若为空则返回默认名称
 func getModelName(payload map[string]any, defaultName string) string {
 	if m, ok := payload["model"].(string); ok && strings.TrimSpace(m) != "" {
 		return m
@@ -1322,6 +1489,7 @@ func getModelName(payload map[string]any, defaultName string) string {
 	return defaultName
 }
 
+// getAny 安全地从 map 中获取指定 key 的值，key 不存在时返回 nil
 func getAny(m map[string]any, key string) any {
 	if m == nil {
 		return nil
@@ -1333,6 +1501,9 @@ func getAny(m map[string]any, key string) any {
 	return v
 }
 
+// coercePositiveInt 将任意类型的安全转换为正整数
+// 支持 float64 和 int 类型，其他类型返回 defaultValue
+// 结果会被限制在 [1, maximum] 范围内
 func coercePositiveInt(value any, defaultValue, maximum int) int {
 	switch v := value.(type) {
 	case float64:

@@ -247,9 +247,8 @@ func ConvertMessages(
 	toolChoice any,
 	serverSideToolNames map[string]bool,
 ) []map[string]any {
-	filteredTools := tools.FilterTools(toolsList)
 	availableToolNames := map[string]bool{}
-	for _, t := range filteredTools {
+	for _, t := range toolsList {
 		fn, _ := t["function"].(map[string]any)
 		if fn == nil {
 			continue
@@ -384,9 +383,9 @@ func ConvertMessages(
 	}
 
 	var transcriptParts []string
-	if len(filteredTools) > 0 && toolChoicePolicy.Mode != "none" {
+	if len(toolsList) > 0 && toolChoicePolicy.Mode != "none" {
 		transcriptParts = append(transcriptParts,
-			tools.ToolsToPrompt(filteredTools, toolChoicePolicy, serverSideToolNames),
+			tools.ToolsToPrompt(toolsList, toolChoicePolicy, serverSideToolNames),
 			"# CONVERSATION",
 		)
 	}
