@@ -41,7 +41,7 @@ var (
 )
 
 // LocalFileHint 追加在本地文件路径后的提示文本，告知 GLM 该文件在本地不在服务端
-const LocalFileHint = "(本地文件，不在服务区上，应该用[function_calls]工具)"
+const LocalFileHint = "(该文件不在工作目录下，应该用[function_calls]格式去读取或者编辑)"
 
 var (
 	// systemReminderRE 匹配 <system-reminder> 标签及其后所有内容
@@ -667,6 +667,9 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						toolName, _ := toolCallsData["name"].(string)
 						toolName = strings.TrimSpace(toolName)
 						// GLM 内部的 open_url 工具在 API 层映射为 read
+						if toolName == "finish" {
+							continue
+						}
 						if toolName == "open_url" {
 							toolName = "read"
 						}
@@ -693,7 +696,7 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 								},
 							})
 						}
-
+						a.toolParser.SetToolCallCompleted()
 					}
 				}
 			}

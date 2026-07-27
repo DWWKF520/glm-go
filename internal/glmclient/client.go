@@ -243,6 +243,7 @@ func NewClient(cfg *config.AppConfig, logger *slog.Logger) *Client {
 //  5. 完成后删除 GLM 会话并释放队列槽位
 //
 // 返回值：一个 channel，持续输出 SSE 格式的 []byte chunks
+// wkf
 func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]any) (<-chan []byte, error) {
 	lease, err := c.RequestQueue.Acquire(fmt.Sprintf("stream:%v", payload["model"]))
 	if err != nil {
@@ -483,7 +484,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 		"messages":        convertedMessages,
 		"meta_data": map[string]any{
 			"channel":             "",
-			"chat_mode":           "thinking", // 启用思考模式
+			"chat_mode":           "deep_thinking", // 启用思考模式
 			"draft_id":            "",
 			"if_plus_model":       true,
 			"input_question_type": "xxxx",
@@ -1259,6 +1260,7 @@ func (c *Client) buildErrorMessage(statusCode int, payload map[string]any) strin
 // raiseForEventError 检查 SSE 事件是否包含错误
 // 从事件的 status、last_error 和 parts 中提取错误信息
 // 返回 nil 表示无错误，返回 *UpstreamAPIError 表示有错误
+// wkf
 func (c *Client) raiseForEventError(event map[string]any, stream bool) error {
 	status, _ := event["status"].(string)
 	statusLower := strings.ToLower(strings.TrimSpace(status))

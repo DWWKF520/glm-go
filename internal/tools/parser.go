@@ -1,12 +1,13 @@
 package tools
 
 import (
-	"github.com/bytedance/sonic"
 	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/bytedance/sonic"
 
 	"github.com/google/uuid"
 )
@@ -565,8 +566,8 @@ func FindPartialMarker(text string) int {
 // 一旦识别到完整的工具调用，_toolCallCompleted 标记为 true，后续输入不再产生可见文本。
 // PendingText 缓存尚未完成解析的文本（例如正在等待闭合标记的代码块）。
 type StreamingToolParser struct {
-	PendingText       string
-	ToolCalls         []map[string]any
+	PendingText        string
+	ToolCalls          []map[string]any
 	_toolCallCompleted bool
 }
 
@@ -631,6 +632,9 @@ func (p *StreamingToolParser) Flush() (string, []map[string]any) {
 // 一旦返回 true，后续 Consume 调用将不再产生可见文本。
 func (p *StreamingToolParser) IsToolCallCompleted() bool {
 	return p._toolCallCompleted
+}
+func (p *StreamingToolParser) SetToolCallCompleted() {
+	p._toolCallCompleted = true
 }
 
 // SplitStreamText 将文本拆分为三部分：可见文本、剩余未完成文本、和已解析的工具调用。
@@ -711,7 +715,7 @@ func SplitStreamText(text string, final bool) (string, string, []map[string]any)
 				return strings.Join(visibleParts, ""), remainder, toolCalls
 			}
 			// 完整的 [function_calls] 块
-			fcBlock := text[nextMarkerPos:fcEndLoc+len(functionCallsEndMarker)]
+			fcBlock := text[nextMarkerPos : fcEndLoc+len(functionCallsEndMarker)]
 			fcCalls := extractFunctionCallsFromText(fcBlock, len(toolCalls))
 			if len(fcCalls) > 0 {
 				toolCalls = append(toolCalls, fcCalls...)
