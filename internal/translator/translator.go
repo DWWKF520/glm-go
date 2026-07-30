@@ -625,6 +625,8 @@ func (a *GLMEventAccumulator) insertSorted(logicID string) {
 // 返回值：
 //   - []string: SSE 格式的 JSON chunks
 //   - string: 状态（"processing"、"finish"、"intervene"、"tool_call_complete"、""）
+//
+// wkf
 func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, string) {
 	logging.DebugDump(a.Logger, a.DebugEnabled, "GLM SSE 解析事件", payload)
 	// 从第一个事件中提取 conversation_id
@@ -676,8 +678,17 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						toolID, _ := toolCallsData["id"].(string)
 						toolID = strings.TrimSpace(toolID)
 						arguments := toolCallsData["arguments"]
-						if toolName == "websearch" {
-							delete(arguments.(map[string]any), "num")
+						if toolName == "WebSearch" {
+							if argsMap, ok := arguments.(map[string]any); ok {
+								if numVal, exists := argsMap["num"]; exists {
+									if numStr, ok := numVal.(string); ok {
+										var numInt int
+										if _, err := fmt.Sscanf(numStr, "%d", &numInt); err == nil {
+											argsMap["num"] = numInt
+										}
+									}
+								}
+							}
 						}
 
 						// 去重：同一个 toolID 只记录一次
@@ -689,10 +700,10 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 							} else {
 								argsStr = tools.SafeJSONDumpsCompact(arguments)
 							}
-							a.serverSideToolCalls = append(a.serverSideToolCalls, map[string]any{
+							a.toolParser.ToolCalls = append(a.toolParser.ToolCalls, map[string]any{
 								"id":    toolID,
 								"type":  "function",
-								"index": len(a.serverSideToolCalls),
+								"index": len(a.toolParser.ToolCalls),
 								"function": map[string]any{
 									"name":      toolName,
 									"arguments": argsStr,
