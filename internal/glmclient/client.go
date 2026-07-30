@@ -29,6 +29,7 @@ import (
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -223,12 +224,26 @@ func NewClient(cfg *config.AppConfig, logger *slog.Logger) *Client {
 		time.Duration(cfg.GLMQueueWaitTimeout)*time.Second,
 		cfg.GLMMaxConcurrency,
 	)
+	// 使用 Transport 级别的超时控制，而不是 Client.Timeout。
+	// Client.Timeout 会限制整个请求的总时长（包括读取响应体），
+	// 对于 SSE 流式响应，这会导致流还未读完就被强制终止。
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   time.Duration(cfg.RequestTimeout) * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   time.Duration(cfg.RequestTimeout) * time.Second,
+		ResponseHeaderTimeout: time.Duration(cfg.RequestTimeout) * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+	}
 	return &Client{
 		config:       cfg,
 		logger:       logger,
 		Auth:         authMgr,
 		RequestQueue: queue,
-		httpClient:   &http.Client{Timeout: time.Duration(cfg.RequestTimeout) * time.Second},
+		httpClient:   &http.Client{Transport: transport},
 	}
 }
 

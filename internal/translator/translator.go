@@ -676,6 +676,9 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						toolID, _ := toolCallsData["id"].(string)
 						toolID = strings.TrimSpace(toolID)
 						arguments := toolCallsData["arguments"]
+						if toolName == "websearch" {
+							delete(arguments.(map[string]any), "num")
+						}
 
 						// 去重：同一个 toolID 只记录一次
 						if toolName != "" && toolID != "" && !a.serverSideToolCallIDs[toolID] {
@@ -762,6 +765,8 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 //  5. 处理 GLM 的 intervene（干预）状态
 //  6. 输出所有工具调用 chunks
 //  7. 输出 finish_reason 和 usage，以及 [DONE] 标记
+//
+// wkf
 func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) []string {
 	// 刷新工具解析器，获取剩余文本和解析出的工具调用
 	tailText, jsonToolCalls := a.toolParser.Flush()
