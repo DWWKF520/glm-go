@@ -942,8 +942,8 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 // wkf
 func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) []string {
 	// 刷新工具解析器，获取剩余文本和解析出的工具调用
-	tailText, jsonToolCalls := a.toolParser.Flush()
-	a.Logger.Info("finalize: tool parser flush", "tailText", tailText, "jsonToolCalls", jsonToolCalls)
+	_, jsonToolCalls := a.toolParser.Flush()
+	a.Logger.Info("finalize: tool parser flush", "jsonToolCalls", jsonToolCalls)
 	jsonToolCalls = SanitizeToolCalls(jsonToolCalls, a.FallbackToolURL, a.ToolsList)
 	// 合并服务端工具调用和 JSON 工具调用，重新索引
 	allToolCalls := make([]map[string]any, len(a.serverSideToolCalls))
@@ -968,49 +968,6 @@ func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) 
 	}
 
 	var chunks []string
-	finalText := tailText
-
-	// 如果没有工具调用但剩余文本包含工具调用标记，尝试从中提取
-	// 这处理了模型输出工具调用但未被 StreamingToolParser 完全解析的情况
-	if len(allToolCalls) == 0 && finalText != "" {
-		recoveredClean, recoveredCalls := tools.ParseToolCallsFromText(finalText)
-		if len(recoveredCalls) > 0 {
-			sanitizedRecovered := SanitizeToolCalls(recoveredCalls, a.FallbackToolURL, a.ToolsList)
-			if len(sanitizedRecovered) > 0 {
-				for _, tc := range sanitizedRecovered {
-					tcCopy := map[string]any{}
-					for k, v := range tc {
-						tcCopy[k] = v
-					}
-					tcCopy["index"] = len(allToolCalls)
-					allToolCalls = append(allToolCalls, tcCopy)
-				}
-				finalText = recoveredClean
-				if a.Logger != nil {
-					a.Logger.Info("finalize: recovered tool call(s) from deferred visible text", "count", len(sanitizedRecovered))
-				}
-			}
-		}
-	}
-
-	// 输出最终可见文本（仅当没有工具调用时）
-	if finalText != "" && len(allToolCalls) == 0 {
-		deltaPayload := map[string]any{"content": finalText}
-		if !a.emittedRole {
-			deltaPayload = map[string]any{"role": "assistant", "content": finalText}
-			a.emittedRole = true
-		}
-		chunks = append(chunks, a.chunkJSON(map[string]any{
-			"choices": []map[string]any{
-				{
-					"index":         0,
-					"delta":         deltaPayload,
-					"finish_reason": nil,
-				},
-			},
-		}))
-	}
-
 	// 处理 GLM 的 intervene（干预）状态：输出干预文本
 	if status == "intervene" && lastError != nil {
 		if interveneText, ok := lastError["intervene_text"].(string); ok && interveneText != "" {
