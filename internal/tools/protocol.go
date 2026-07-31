@@ -327,12 +327,11 @@ func ToolsToPrompt(tools []map[string]any, policy ToolChoicePolicy, serverSideTo
 	}
 
 	parts := []string{
+		"you must use answer as the assistant role,without user or tool_result role.",
 		"# TOOL SCHEMAS",
 		"Use ONLY the tools defined below. Obey the protocol rules that follow.",
 		"",
 		strings.Join(toolSchemas, "\n\n"),
-		"",
-		BuildToolCallInstructions(toolNames, serverSideToolNames, policy),
 	}
 	var filtered []string
 	for _, p := range parts {

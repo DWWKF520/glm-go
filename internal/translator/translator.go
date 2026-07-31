@@ -327,6 +327,8 @@ func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string) []map[str
 //   - toolsList: OpenAI 格式的工具定义列表
 //   - toolChoice: tool_choice 参数（"auto"/"none"/"required" 或指定工具名）
 //   - serverSideToolNames: 服务端原生工具名集合（由后端自动执行）
+//
+// wkf
 func ConvertMessages(
 	messages []map[string]any,
 	toolsList []map[string]any,
@@ -446,7 +448,7 @@ func ConvertMessages(
 			if toolCallID != "" && repairedToolCallIDs[toolCallID] {
 				continue
 			}
-			role = "user" // GLM 没有独立的 tool 角色，统一为 user
+			role = "tool_result" // GLM 没有独立的 tool 角色，统一为 user
 			toolName, _ := message["name"].(string)
 			toolName = strings.TrimSpace(toolName)
 			if toolName == "" && toolCallID != "" {
@@ -496,8 +498,8 @@ func ConvertMessages(
 			title = "Assistant"
 		case "user":
 			title = "User"
-		case "developer":
-			title = "Developer"
+		case "tool_result":
+			title = "Tool Result"
 		}
 		line := title + ": " + item.content
 		transcriptParts = append(transcriptParts, strings.TrimSpace(line))
@@ -691,25 +693,27 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 							}
 						}
 
+						argsStr := "{}"
+						if s, ok := arguments.(string); ok {
+							argsStr = s
+						} else {
+							argsStr = tools.SafeJSONDumpsCompact(arguments)
+						}
+
 						// 去重：同一个 toolID 只记录一次
 						if toolName != "" && toolID != "" && !a.serverSideToolCallIDs[toolID] {
 							a.serverSideToolCallIDs[toolID] = true
-							argsStr := "{}"
-							if s, ok := arguments.(string); ok {
-								argsStr = s
-							} else {
-								argsStr = tools.SafeJSONDumpsCompact(arguments)
-							}
-							a.toolParser.ToolCalls = append(a.toolParser.ToolCalls, map[string]any{
+							a.serverSideToolCalls = append(a.serverSideToolCalls, map[string]any{
 								"id":    toolID,
 								"type":  "function",
-								"index": len(a.toolParser.ToolCalls),
+								"index": len(a.serverSideToolCalls),
 								"function": map[string]any{
 									"name":      toolName,
 									"arguments": argsStr,
 								},
 							})
 						}
+						a.Logger.Info("Server-side tool call:", "name:", toolName, "args:", argsStr)
 						a.toolParser.SetToolCallCompleted()
 					}
 				}
