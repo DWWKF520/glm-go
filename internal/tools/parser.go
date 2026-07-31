@@ -149,6 +149,30 @@ func TryParseJSON(text string) any {
 	return nil
 }
 
+// TryParseJSONLenient 是 TryParseJSON 的宽松版本，自动尝试修复常见 JSON 错误。
+// 相比 TryParseJSON，它额外处理：
+//   - 提取文本中第一个平衡的 JSON 对象（忽略前后多余字符）
+//   - 修复尾随逗号等常见格式问题
+//
+// 用于处理 LLM 输出中夹杂多余文本的 JSON（如 `prefix {"a":1} extra`）。
+// 解析成功返回任意类型的 JSON 值，失败返回 nil。
+func TryParseJSONLenient(text string) any {
+	if v := TryParseJSON(text); v != nil {
+		return v
+	}
+	// 尝试提取第一个平衡的 JSON 对象（忽略前后多余字符）
+	objText, _ := ExtractFirstJSONObject(text, 0)
+	if objText == "" {
+		return nil
+	}
+	if v := TryParseJSON(objText); v != nil {
+		return v
+	}
+	// 最后尝试修复后解析
+	fixed := FixCommonJsonErrors(objText)
+	return TryParseJSON(fixed)
+}
+
 // trailingCommaRE 匹配 JSON 中 } 或 ] 前的尾随逗号，用于 FixCommonJsonErrors 修复 LLM 输出
 var trailingCommaRE = regexp.MustCompile(`,\s*([\]}])`)
 
@@ -194,44 +218,15 @@ func ExtractFirstJSONObject(text string, start int) (string, [2]int) {
 }
 
 // ExtractCallArgsBalanced 从 [call:name]...[/call] 格式的调用项中提取平衡的 JSON 参数。
-// 从 text 开头开始，找到第一个 '{' 并跟踪大括号深度，提取完整的 JSON 对象。
+// 等价于 ExtractFirstJSONObject(text, 0)，但返回值更简洁：仅返回 JSON 文本和结束位置。
 // 返回两个值：JSON 参数字符串，以及参数结束后的文本位置。
 // 如果找不到有效 JSON，返回 ("", -1)。
 func ExtractCallArgsBalanced(text string) (string, int) {
-	pos := indexFrom(text, "{", 0)
-	if pos == -1 {
+	objText, span := ExtractFirstJSONObject(text, 0)
+	if objText == "" {
 		return "", -1
 	}
-	depth := 0
-	inString := false
-	escape := false
-	for i := pos; i < len(text); i++ {
-		c := text[i]
-		if escape {
-			escape = false
-			continue
-		}
-		if c == '\\' {
-			escape = true
-			continue
-		}
-		if c == '"' {
-			inString = !inString
-			continue
-		}
-		if inString {
-			continue
-		}
-		if c == '{' {
-			depth++
-		} else if c == '}' {
-			depth--
-			if depth == 0 {
-				return text[pos : i+1], i + 1
-			}
-		}
-	}
-	return "", -1
+	return objText, span[1]
 }
 
 // FixCommonJsonErrors 修复 LLM 输出中常见的 JSON 格式错误。
@@ -598,34 +593,29 @@ func (p *StreamingToolParser) Consume(chunk string) string {
 }
 
 // Flush 刷新解析器中剩余的所有文本，在流式响应结束时调用。
-// 返回最终的可见文本和完整的工具调用列表。
-// 如果还有未完成的工具调用，直接返回已收集的结果。
-// 如果剩余文本中仍有未完成的代码块，尝试从不完整块中挽救工具调用。
-// 如果挽救失败，将剩余文本作为可见文本返回给用户。
-func (p *StreamingToolParser) Flush() (string, []map[string]any) {
+// 返回完整的工具调用列表。
+// 如果工具调用已完成，直接返回已收集的结果。
+// 否则对剩余文本做最终解析（final=true），并尝试从不完整块中挽救工具调用。
+func (p *StreamingToolParser) Flush() []map[string]any {
 	if p._toolCallCompleted {
-		return "", p.ToolCalls
+		return p.ToolCalls
 	}
-	visible, remainder, parsedCalls := SplitStreamText(p.PendingText, true)
+	// final=true：SplitStreamText 内部已会从不完整块中挽救工具调用
+	_, remainder, parsedCalls := SplitStreamText(p.PendingText, true)
 	p.ToolCalls = append(p.ToolCalls, parsedCalls...)
 	if len(parsedCalls) > 0 {
 		p._toolCallCompleted = true
 	}
-
-	tail := ""
+	// SplitStreamText 未解析出工具调用时，对剩余的不完整文本再做一次挽救尝试
 	if remainder != "" && !p._toolCallCompleted {
 		salvaged := SalvageIncompleteBlock(remainder, p.ToolCalls)
-		if salvaged != nil {
-			p.PendingText = ""
+		if len(salvaged) > 0 {
+			p.ToolCalls = append(p.ToolCalls, salvaged...)
 			p._toolCallCompleted = true
-		} else {
-			tail = remainder
-			p.PendingText = ""
 		}
-	} else {
-		p.PendingText = ""
 	}
-	return strings.TrimSpace(visible + tail), p.ToolCalls
+	p.PendingText = ""
+	return p.ToolCalls
 }
 
 // IsToolCallCompleted 返回解析器是否已经识别到至少一个完整的工具调用。
@@ -651,56 +641,48 @@ func SplitStreamText(text string, final bool) (string, string, []map[string]any)
 	cursor := 0
 
 	for cursor < len(text) {
-		// 找到下一个 tool_code / tool_result / [function_calls] 标记
-		startLoc := findFrom(cursor, text, ToolCodeStartPattern)
-		resultLoc := findFrom(cursor, text, ToolResultStartPattern)
-		fcStartLoc := findFrom(cursor, text, FunctionCallsStartPattern)
-
-		nextMarkerPos := -1
-		nextMarkerKind := ""
-		if startLoc != -1 {
-			nextMarkerPos = startLoc
-			nextMarkerKind = "tool_code"
+		// 查找下一个标记（一次搜索同时获取起始和结束位置，避免重复搜索）
+		var mkKind string
+		var mkStart, mkEnd = -1, 0
+		if loc := findMatchFrom(text, cursor, ToolCodeStartPattern); loc != nil {
+			mkKind, mkStart, mkEnd = "tool_code", loc[0], loc[1]
 		}
-		if resultLoc != -1 && (nextMarkerPos == -1 || resultLoc < nextMarkerPos) {
-			nextMarkerPos = resultLoc
-			nextMarkerKind = "tool_result"
-		}
-		if fcStartLoc != -1 && (nextMarkerPos == -1 || fcStartLoc < nextMarkerPos) {
-			nextMarkerPos = fcStartLoc
-			nextMarkerKind = "function_calls"
-		}
-
-		if nextMarkerPos == -1 {
-			// 没有更多标记 - 输出到尾部部分标记为止
-			var partialPos int
-			if !final {
-				partialPos = FindPartialMarker(text[cursor:])
-			} else {
-				partialPos = -1
+		if loc := findMatchFrom(text, cursor, ToolResultStartPattern); loc != nil {
+			if mkKind == "" || loc[0] < mkStart {
+				mkKind, mkStart, mkEnd = "tool_result", loc[0], loc[1]
 			}
-			if partialPos != -1 {
-				visibleParts = append(visibleParts, text[cursor:cursor+partialPos])
-				remainder := text[cursor+partialPos:]
-				return strings.Join(visibleParts, ""), remainder, toolCalls
+		}
+		if loc := findMatchFrom(text, cursor, FunctionCallsStartPattern); loc != nil {
+			if mkKind == "" || loc[0] < mkStart {
+				mkKind, mkStart, mkEnd = "function_calls", loc[0], loc[1]
+			}
+		}
+
+		if mkKind == "" {
+			// 没有更多标记 - 输出到尾部部分标记为止
+			if !final {
+				if partialPos := FindPartialMarker(text[cursor:]); partialPos != -1 {
+					visibleParts = append(visibleParts, text[cursor:cursor+partialPos])
+					return strings.Join(visibleParts, ""), text[cursor+partialPos:], toolCalls
+				}
 			}
 			visibleParts = append(visibleParts, text[cursor:])
 			return strings.Join(visibleParts, ""), "", toolCalls
 		}
 
 		// 输出标记前的文本
-		if nextMarkerPos > cursor {
-			visibleParts = append(visibleParts, text[cursor:nextMarkerPos])
+		if mkStart > cursor {
+			visibleParts = append(visibleParts, text[cursor:mkStart])
 		}
 
-		if nextMarkerKind == "function_calls" {
+		if mkKind == "function_calls" {
 			// [function_calls] 块：查找 [/function_calls] 结束标记
-			fcEndLoc := findFrom(nextMarkerPos, text, FunctionCallsEndPattern)
+			fcEndLoc := findFrom(mkStart, text, FunctionCallsEndPattern)
 			if fcEndLoc == -1 {
 				// 不完整的 [function_calls] 块
 				if final {
 					// 最终模式：尝试从不完整块中提取工具调用
-					fcBody := text[nextMarkerPos:]
+					fcBody := text[mkStart:]
 					fcCalls := extractFunctionCallsFromText(fcBody, len(toolCalls))
 					if len(fcCalls) > 0 {
 						toolCalls = append(toolCalls, fcCalls...)
@@ -711,11 +693,10 @@ func SplitStreamText(text string, final bool) (string, string, []map[string]any)
 					return strings.Join(visibleParts, ""), "", toolCalls
 				}
 				// 保留整个块等待更多数据
-				remainder := text[nextMarkerPos:]
-				return strings.Join(visibleParts, ""), remainder, toolCalls
+				return strings.Join(visibleParts, ""), text[mkStart:], toolCalls
 			}
 			// 完整的 [function_calls] 块
-			fcBlock := text[nextMarkerPos : fcEndLoc+len(functionCallsEndMarker)]
+			fcBlock := text[mkStart : fcEndLoc+len(functionCallsEndMarker)]
 			fcCalls := extractFunctionCallsFromText(fcBlock, len(toolCalls))
 			if len(fcCalls) > 0 {
 				toolCalls = append(toolCalls, fcCalls...)
@@ -724,33 +705,13 @@ func SplitStreamText(text string, final bool) (string, string, []map[string]any)
 			continue
 		}
 
-		// 找到标记的结束位置
-		var markerEnd int
-		if nextMarkerKind == "tool_code" {
-			loc := ToolCodeStartPattern.FindStringIndex(text[cursor:])
-			markerEnd = cursor + loc[1]
-		} else {
-			loc := ToolResultStartPattern.FindStringIndex(text[cursor:])
-			markerEnd = cursor + loc[1]
-		}
-
-		if nextMarkerKind == "tool_result" {
-			// 查找 tool_result 块的闭合标记
-			closePos, closeLen := FindFenceClose(text, markerEnd)
-			if closePos == -1 {
-				remainder := text[nextMarkerPos:]
-				return strings.Join(visibleParts, ""), remainder, toolCalls
-			}
-			cursor = closePos + closeLen
-			continue
-		}
-
-		// tool_code 块：查找闭合标记
-		closePos, closeLen := FindFenceClose(text, markerEnd)
+		// tool_code / tool_result 块：共用闭合标记查找
+		closePos, closeLen := FindFenceClose(text, mkEnd)
 		if closePos == -1 {
 			// 不完整块
-			if final {
-				body := text[markerEnd:]
+			if mkKind == "tool_code" && final {
+				// 最终模式：尝试从不完整的 tool_code 块中提取工具调用
+				body := text[mkEnd:]
 				payload := TryParseJSON(body)
 				if payload == nil {
 					payload = map[string]any{}
@@ -761,31 +722,34 @@ func SplitStreamText(text string, final bool) (string, string, []map[string]any)
 					cursor = len(text)
 					continue
 				}
-				// 挽救失败 - 输出部分块作为可见文本
-				visibleParts = append(visibleParts, text[nextMarkerPos:])
+				visibleParts = append(visibleParts, text[mkStart:])
 				return strings.Join(visibleParts, ""), "", toolCalls
 			}
 			// 保留整个块等待更多数据
-			remainder := text[nextMarkerPos:]
-			return strings.Join(visibleParts, ""), remainder, toolCalls
+			return strings.Join(visibleParts, ""), text[mkStart:], toolCalls
 		}
 
-		bodyEnd := closePos
-		blockEnd := closePos + closeLen
-		body := text[markerEnd:bodyEnd]
+		if mkKind == "tool_result" {
+			// tool_result 块：直接跳过
+			cursor = closePos + closeLen
+			continue
+		}
+
+		// tool_code 块：解析 JSON 提取工具调用
+		body := text[mkEnd:closePos]
 		payload := TryParseJSON(body)
 		if payload != nil {
 			blockCalls := ExtractCallsFromPayload(payload, len(toolCalls))
 			if len(blockCalls) > 0 {
 				toolCalls = append(toolCalls, blockCalls...)
 			}
-			cursor = blockEnd
+			cursor = closePos + closeLen
 			continue
 		}
 
 		// 解析失败 - 输出块作为可见文本
-		visibleParts = append(visibleParts, text[nextMarkerPos:blockEnd])
-		cursor = blockEnd
+		visibleParts = append(visibleParts, text[mkStart:closePos+closeLen])
+		cursor = closePos + closeLen
 	}
 
 	return strings.Join(visibleParts, ""), "", toolCalls
@@ -927,6 +891,20 @@ func findFrom(startFrom int, text string, re *regexp.Regexp) int {
 		return -1
 	}
 	return startFrom + loc[0]
+}
+
+// findMatchFrom 从 text 的 startFrom 位置开始，查找正则表达式 re 的第一次匹配。
+// 返回匹配在原文中的绝对 [start, end] 位置；如果未找到或 startFrom 超出文本范围，返回 nil。
+// 与 findFrom 的区别：额外返回匹配结束位置，避免调用者再次搜索。
+func findMatchFrom(text string, startFrom int, re *regexp.Regexp) []int {
+	if startFrom >= len(text) {
+		return nil
+	}
+	loc := re.FindStringIndex(text[startFrom:])
+	if loc == nil {
+		return nil
+	}
+	return []int{startFrom + loc[0], startFrom + loc[1]}
 }
 
 // ResetLogger 将工具解析器的日志记录器重置为默认值。

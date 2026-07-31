@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -110,7 +111,7 @@ func TestStreamingToolParser_FunctionCalls(t *testing.T) {
 		t.Errorf("expected tool name Skill, got %v", fn)
 	}
 	// 可见文本不应包含 function_calls 标记
-	if len(allVisible) > 0 && contains(allVisible, "[function_calls]") {
+	if len(allVisible) > 0 && strings.Contains(allVisible, "[function_calls]") {
 		t.Errorf("visible text should not contain [function_calls]: %s", allVisible)
 	}
 }
@@ -121,20 +122,7 @@ func TestParseToolCallsFromText_FunctionCalls(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 call, got %d", len(calls))
 	}
-	if contains(cleaned, "[function_calls]") {
+	if strings.Contains(cleaned, "[function_calls]") {
 		t.Errorf("cleaned text should not contain [function_calls]: %s", cleaned)
 	}
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && searchString(s, sub)
-}
-
-func searchString(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

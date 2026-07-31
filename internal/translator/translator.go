@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -251,10 +252,12 @@ func buildToolParamTypeMap(toolsList []map[string]any) map[string]map[string]str
 // 处理模型常见的类型错误：
 //   - integer/number 类型：字符串 "5" → 数字 5
 //   - boolean 类型：字符串 "true"/"false" → 布尔值
+//   - array 类型：字符串（双重序列化的 JSON）→ []any
+//   - object 类型：字符串（双重序列化的 JSON）→ map[string]any
 //
 // 参数：
 //   - value: 原始参数值
-//   - expectedType: 期望的参数类型（如 "integer", "number", "boolean"）
+//     expectedType: 期望的参数类型（如 "integer", "number", "boolean", "array", "object"）
 //
 // 返回矫正后的值，如果无法转换则返回原值
 func coerceParamValue(value any, expectedType string) any {
@@ -299,6 +302,31 @@ func coerceParamValue(value any, expectedType string) any {
 				return true
 			case "false", "0", "no":
 				return false
+			}
+		}
+	case "array":
+		// 字符串 → 数组（处理 GLM 双重序列化的 JSON 字符串）
+		// 如 todos="[{\"id\":\"1\"}]" → [{"id":"1"}]
+		if s, ok := value.(string); ok {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return value
+			}
+			var arr []any
+			if err := sonic.UnmarshalString(s, &arr); err == nil {
+				return arr
+			}
+		}
+	case "object":
+		// 字符串 → 对象（处理 GLM 双重序列化的 JSON 字符串）
+		if s, ok := value.(string); ok {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return value
+			}
+			var obj map[string]any
+			if err := sonic.UnmarshalString(s, &obj); err == nil {
+				return obj
 			}
 		}
 	}
@@ -753,75 +781,9 @@ func (a *GLMEventAccumulator) insertSorted(logicID string) {
 	a.orderedLogicIDs[idx] = logicID
 }
 
-// extractEmbeddedArgsFromName 兼容 GLM 服务端将参数嵌入 name 字段的异常格式。
-//
-// 正常情况下 GLM 返回的 tool_calls.name 应为纯工具名（如 "Read"），
-// 但实际观察中会出现将参数 JSON 直接拼接在 name 后的情况，例如：
-//
-//	name = `Read{"file_path":"C:\\path\\file.txt"}`
-//	name = `open_url{"url":"https://example.com"}}`  （含多余尾部字符）
-//
-// 同时 arguments 字段为空或 {}。
-//
-// 本函数从 name 中分离出真正的工具名和嵌入的参数：
-//  1. 查找 name 中第一个 '{' 字符
-//  2. 取 '{' 之前的部分作为实际工具名（trim 后）
-//  3. 用括号平衡算法提取完整的 JSON 对象（自动忽略尾部多余字符）
-//  4. 解析 JSON 为 map[string]any，失败时尝试修复常见的 JSON 错误
-//
-// 返回值：
-//   - actualName: 真正的工具名（已 trim）
-//   - args: 解析出的参数 map（ok=true 时不为 nil）
-//   - ok: 是否成功从 name 中提取出嵌入参数
-//
-// 如果 name 中没有 '{'、'{' 在首位（无工具名前缀）、或 JSON 解析失败，
-// 返回 (原 name, nil, false)。
-func extractEmbeddedArgsFromName(name string) (actualName string, args map[string]any, ok bool) {
-	braceIdx := strings.Index(name, "{")
-	if braceIdx <= 0 { // '{' 不存在或在首位（无工具名前缀）
-		return name, nil, false
-	}
-	candidate := strings.TrimSpace(name[:braceIdx])
-	if candidate == "" {
-		return name, nil, false
-	}
-	jsonPart := name[braceIdx:]
-	// 用括号平衡算法提取第一个完整的 JSON 对象，自动忽略尾部多余字符
-	argsStr, _ := tools.ExtractCallArgsBalanced(jsonPart)
-	if argsStr == "" {
-		return candidate, nil, false
-	}
-	parsed := tools.TryParseJSON(argsStr)
-	if parsed == nil {
-		// 尝试修复常见的 JSON 错误（如尾随逗号）
-		fixed := tools.FixCommonJsonErrors(argsStr)
-		parsed = tools.TryParseJSON(fixed)
-	}
-	if parsed == nil {
-		return candidate, nil, false
-	}
-	argsMap, isMap := parsed.(map[string]any)
-	if !isMap {
-		// JSON 解析为非 map 类型（如数组、字符串），包装为 map
-		argsMap = map[string]any{"value": parsed}
-	}
-	return candidate, argsMap, true
-}
-
-// argumentsIsEmpty 判断 tool_calls.arguments 字段的值是否视为空。
-// 支持三种类型：nil、string（空或 "{}"）、map（长度为 0）。
-func argumentsIsEmpty(v any) bool {
-	switch x := v.(type) {
-	case nil:
-		return true
-	case string:
-		trimmed := strings.TrimSpace(x)
-		return trimmed == "" || trimmed == "{}"
-	case map[string]any:
-		return len(x) == 0
-	}
-	return false
-}
+// extractEmbeddedArgsFromName 和 argumentsIsEmpty 已移至 tools 包（protocol.go），
+// 因为它们是通用的工具调用参数处理逻辑，不依赖 translator 状态。
+// 详见 tools.ExtractEmbeddedArgsFromName 和 tools.ArgumentsIsEmpty。
 
 // ConsumeEvent 消费一个 GLM SSE 事件，返回增量 chunks 和当前状态
 //
@@ -884,7 +846,7 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						// 兼容 GLM 服务端将参数嵌入 name 字段的异常格式
 						// 如 name = `Read{"file_path":"..."}`，需要分离出真正的工具名和参数
 						var embeddedArgs map[string]any
-						if actualName, args, ok := extractEmbeddedArgsFromName(toolName); ok {
+						if actualName, args, ok := tools.ExtractEmbeddedArgsFromName(toolName); ok {
 							toolName = actualName
 							embeddedArgs = args
 						}
@@ -899,7 +861,7 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						toolID = strings.TrimSpace(toolID)
 						arguments := toolCallsData["arguments"]
 						// 如果 arguments 为空但 name 中嵌入了参数，使用嵌入的参数
-						if argumentsIsEmpty(arguments) && embeddedArgs != nil {
+						if tools.ArgumentsIsEmpty(arguments) && embeddedArgs != nil {
 							arguments = embeddedArgs
 							a.Logger.Debug("使用 name 中嵌入的参数作为 arguments", "toolName", toolName)
 						}
@@ -1023,8 +985,8 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 //
 // wkf
 func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) []string {
-	// 刷新工具解析器，获取剩余文本和解析出的工具调用
-	_, jsonToolCalls := a.toolParser.Flush()
+	// 刷新工具解析器，获取解析出的工具调用
+	jsonToolCalls := a.toolParser.Flush()
 	a.Logger.Info("finalize: tool parser flush", "jsonToolCalls", jsonToolCalls)
 	jsonToolCalls = SanitizeToolCalls(jsonToolCalls, a.FallbackToolURL, a.ToolsList)
 	// 合并服务端工具调用和 JSON 工具调用，重新索引
@@ -1175,7 +1137,7 @@ func (a *GLMEventAccumulator) computeDeltas() (string, string) {
 		// 计算文本增量
 		if renderedText != "" {
 			prevLen := a.partTextSent[logicID]
-			isNew := !containsString(a.knownLogicIDsForText, logicID)
+			isNew := !slices.Contains(a.knownLogicIDsForText, logicID)
 			if isNew {
 				// 新 part：输出完整内容
 				a.knownLogicIDsForText = append(a.knownLogicIDsForText, logicID)
@@ -1193,7 +1155,7 @@ func (a *GLMEventAccumulator) computeDeltas() (string, string) {
 		// 计算推理增量（逻辑与文本相同）
 		if renderedReasoning != "" {
 			prevLen := a.partReasoningSent[logicID]
-			isNew := !containsString(a.knownLogicIDsForReasoning, logicID)
+			isNew := !slices.Contains(a.knownLogicIDsForReasoning, logicID)
 			if isNew {
 				a.knownLogicIDsForReasoning = append(a.knownLogicIDsForReasoning, logicID)
 				if len(reasoningDeltaParts) > 0 || len(a.partReasoningSent) > 0 {
@@ -1307,16 +1269,6 @@ func (a *GLMEventAccumulator) chunkJSON(patch map[string]any) string {
 		return "data: {}\n\n"
 	}
 	return "data: " + jsonStr + "\n\n"
-}
-
-// containsString 检查字符串切片中是否包含指定值
-func containsString(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 
 // filterEmpty 过滤掉字符串切片中的空字符串

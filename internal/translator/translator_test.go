@@ -3,6 +3,8 @@ package translator
 import (
 	"strings"
 	"testing"
+
+	"glm2api/internal/tools"
 )
 
 // TestLocalFileHintConstant 验证 LocalFileHint 与 Python LOCAL_FILE_HINT 一致
@@ -264,7 +266,7 @@ func TestExtractEmbeddedArgsFromName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotName, gotArgs, gotOk := extractEmbeddedArgsFromName(tt.input)
+			gotName, gotArgs, gotOk := tools.ExtractEmbeddedArgsFromName(tt.input)
 			if gotName != tt.wantName {
 				t.Errorf("name = %q, want %q", gotName, tt.wantName)
 			}
@@ -310,8 +312,8 @@ func TestArgumentsIsEmpty(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := argumentsIsEmpty(tt.input); got != tt.want {
-				t.Errorf("argumentsIsEmpty(%v) = %v, want %v", tt.input, got, tt.want)
+			if got := tools.ArgumentsIsEmpty(tt.input); got != tt.want {
+				t.Errorf("ArgumentsIsEmpty(%v) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
 	}
@@ -412,4 +414,162 @@ func TestConsumeEventServerSideToolCallPrefersExplicitArguments(t *testing.T) {
 	if strings.Contains(args, "embedded.txt") {
 		t.Errorf("should not use embedded args when explicit arguments provided, got %q", args)
 	}
+}
+
+// TestCoerceParamValue 验证参数类型矫正逻辑
+func TestCoerceParamValue(t *testing.T) {
+	tests := []struct {
+		name         string
+		value        any
+		expectedType string
+		want         any
+	}{
+		// integer
+		{"integer 字符串", "5", "integer", int64(5)},
+		{"integer 浮点字符串", "5.0", "integer", int64(5)},
+		{"integer 浮点数", float64(5), "integer", int64(5)},
+		{"integer 无效字符串", "abc", "integer", "abc"},
+		{"integer 空字符串", "", "integer", ""},
+		// number
+		{"number 字符串", "3.14", "number", 3.14},
+		{"number 无效", "abc", "number", "abc"},
+		// boolean
+		{"boolean true", "true", "boolean", true},
+		{"boolean false", "false", "boolean", false},
+		{"boolean 1", "1", "boolean", true},
+		{"boolean yes", "yes", "boolean", true},
+		{"boolean 无效", "maybe", "boolean", "maybe"},
+		// array：双重序列化的 JSON 字符串 → 数组（复现日志 L23 的场景）
+		{
+			name:         "array 双重序列化字符串（日志场景）",
+			value:        `[{"id":"1","content":"task","status":"pending","priority":"high"}]`,
+			expectedType: "array",
+			want:         []any{map[string]any{"id": "1", "content": "task", "status": "pending", "priority": "high"}},
+		},
+		{
+			name:         "array 空数组字符串",
+			value:        `[]`,
+			expectedType: "array",
+			want:         []any{},
+		},
+		{
+			name:         "array 已经是数组（不变）",
+			value:        []any{map[string]any{"id": "1"}},
+			expectedType: "array",
+			want:         []any{map[string]any{"id": "1"}},
+		},
+		{
+			name:         "array 空字符串",
+			value:        "",
+			expectedType: "array",
+			want:         "",
+		},
+		{
+			name:         "array 非数组 JSON（对象）",
+			value:        `{"id":"1"}`,
+			expectedType: "array",
+			want:         `{"id":"1"}`, // 不是数组，无法转换，返回原值
+		},
+		// object：双重序列化的 JSON 字符串 → 对象
+		{
+			name:         "object 双重序列化字符串",
+			value:        `{"file_path":"/a/b.go","content":"x"}`,
+			expectedType: "object",
+			want:         map[string]any{"file_path": "/a/b.go", "content": "x"},
+		},
+		{
+			name:         "object 已经是 map（不变）",
+			value:        map[string]any{"key": "val"},
+			expectedType: "object",
+			want:         map[string]any{"key": "val"},
+		},
+		{
+			name:         "object 空字符串",
+			value:        "",
+			expectedType: "object",
+			want:         "",
+		},
+		// 未知类型：返回原值
+		{"未知类型", "value", "custom", "value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := coerceParamValue(tt.value, tt.expectedType)
+			if !deepEqual(got, tt.want) {
+				t.Errorf("coerceParamValue(%v, %q) = %v (%T), want %v (%T)",
+					tt.value, tt.expectedType, got, got, tt.want, tt.want)
+			}
+		})
+	}
+}
+
+// TestCoerceParamValueArrayDoubleSerialized 复现日志 L23 的完整场景：
+// TodoWrite 工具的 todos 参数被 GLM 双重序列化为字符串，验证能被矫正回数组
+func TestCoerceParamValueArrayDoubleSerialized(t *testing.T) {
+	// 日志 L23 中的实际数据：todos 是字符串，内容是转义的 JSON 数组
+	doubleSerialized := `[{"id": "1", "content": "Read docs", "status": "in_progress", "priority": "high"}, {"id": "2", "content": "Create folder", "status": "pending", "priority": "high"}]`
+
+	result := coerceParamValue(doubleSerialized, "array")
+
+	arr, ok := result.([]any)
+	if !ok {
+		t.Fatalf("expected []any, got %T: %v", result, result)
+	}
+	if len(arr) != 2 {
+		t.Fatalf("expected 2 elements, got %d", len(arr))
+	}
+
+	// 验证第一个元素
+	first, ok := arr[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first element to be map[string]any, got %T", arr[0])
+	}
+	if first["id"] != "1" {
+		t.Errorf("first element id = %v, want %q", first["id"], "1")
+	}
+	if first["content"] != "Read docs" {
+		t.Errorf("first element content = %v, want %q", first["content"], "Read docs")
+	}
+	if first["status"] != "in_progress" {
+		t.Errorf("first element status = %v, want %q", first["status"], "in_progress")
+	}
+}
+
+// deepEqual 深度比较两个值是否相等（处理 []any 和 map[string]any）
+func deepEqual(a, b any) bool {
+	// 处理 nil
+	if a == nil || b == nil {
+		return a == b
+	}
+	// 比较 []any
+	aa, aok := a.([]any)
+	ba, bok := b.([]any)
+	if aok && bok {
+		if len(aa) != len(ba) {
+			return false
+		}
+		for i := range aa {
+			if !deepEqual(aa[i], ba[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	// 比较 map[string]any
+	am, amok := a.(map[string]any)
+	bm, bmok := b.(map[string]any)
+	if amok && bmok {
+		if len(am) != len(bm) {
+			return false
+		}
+		for k, v := range am {
+			if !deepEqual(v, bm[k]) {
+				return false
+			}
+		}
+		return true
+	}
+	// 其他类型直接比较
+	return a == b
 }

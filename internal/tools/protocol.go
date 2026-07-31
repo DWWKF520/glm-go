@@ -72,6 +72,71 @@ func NormalizeArguments(payload any) map[string]any {
 	return result
 }
 
+// ArgumentsIsEmpty 判断 tool_calls.arguments 字段的值是否视为空。
+// 支持三种类型：nil、string（空或 "{}"）、map（长度为 0）。
+// 其他类型视为非空。
+func ArgumentsIsEmpty(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		trimmed := strings.TrimSpace(x)
+		return trimmed == "" || trimmed == "{}"
+	case map[string]any:
+		return len(x) == 0
+	}
+	return false
+}
+
+// ExtractEmbeddedArgsFromName 兼容 GLM 服务端将参数嵌入 name 字段的异常格式。
+//
+// 正常情况下 GLM 返回的 tool_calls.name 应为纯工具名（如 "Read"），
+// 但实际观察中会出现将参数 JSON 直接拼接在 name 后的情况，例如：
+//   name = `Read{"file_path":"C:\\path\\file.txt"}`
+//   name = `open_url{"url":"https://example.com"}}`  （含多余尾部字符）
+// 同时 arguments 字段为空或 {}。
+//
+// 本函数从 name 中分离出真正的工具名和嵌入的参数：
+//  1. 查找 name 中第一个 '{' 字符
+//  2. 取 '{' 之前的部分作为实际工具名（trim 后）
+//  3. 用括号平衡算法提取完整的 JSON 对象（自动忽略尾部多余字符）
+//  4. 用 TryParseJSONLenient 宽松解析为 map[string]any
+//
+// 返回值：
+//   - actualName: 真正的工具名（已 trim）
+//   - args: 解析出的参数 map（ok=true 时不为 nil）
+//   - ok: 是否成功从 name 中提取出嵌入参数
+//
+// 如果 name 中没有 '{'、'{' 在首位（无工具名前缀）、或 JSON 解析失败，
+// 返回 (原 name, nil, false)。
+func ExtractEmbeddedArgsFromName(name string) (actualName string, args map[string]any, ok bool) {
+	braceIdx := strings.Index(name, "{")
+	if braceIdx <= 0 { // '{' 不存在或在首位（无工具名前缀）
+		return name, nil, false
+	}
+	candidate := strings.TrimSpace(name[:braceIdx])
+	if candidate == "" {
+		return name, nil, false
+	}
+	jsonPart := name[braceIdx:]
+	// 用括号平衡算法提取第一个完整的 JSON 对象，自动忽略尾部多余字符
+	argsStr, _ := ExtractCallArgsBalanced(jsonPart)
+	if argsStr == "" {
+		return candidate, nil, false
+	}
+	// 宽松解析：自动处理尾随逗号等常见错误
+	parsed := TryParseJSONLenient(argsStr)
+	if parsed == nil {
+		return candidate, nil, false
+	}
+	argsMap, isMap := parsed.(map[string]any)
+	if !isMap {
+		// JSON 解析为非 map 类型（如数组、字符串），包装为 map
+		argsMap = map[string]any{"value": parsed}
+	}
+	return candidate, argsMap, true
+}
+
 // SerializeToolCallBlock 将工具调用序列化为 [function_calls] 格式的文本块。
 // 参数 name 是工具名称，arguments 是原始参数（会被 NormalizeArguments 规范化后序列化）。
 // 返回格式：[function_calls]\n[call:name]{"param":"value"}[/call]\n[/function_calls]
