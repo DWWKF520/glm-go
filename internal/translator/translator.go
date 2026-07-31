@@ -753,6 +753,76 @@ func (a *GLMEventAccumulator) insertSorted(logicID string) {
 	a.orderedLogicIDs[idx] = logicID
 }
 
+// extractEmbeddedArgsFromName 兼容 GLM 服务端将参数嵌入 name 字段的异常格式。
+//
+// 正常情况下 GLM 返回的 tool_calls.name 应为纯工具名（如 "Read"），
+// 但实际观察中会出现将参数 JSON 直接拼接在 name 后的情况，例如：
+//
+//	name = `Read{"file_path":"C:\\path\\file.txt"}`
+//	name = `open_url{"url":"https://example.com"}}`  （含多余尾部字符）
+//
+// 同时 arguments 字段为空或 {}。
+//
+// 本函数从 name 中分离出真正的工具名和嵌入的参数：
+//  1. 查找 name 中第一个 '{' 字符
+//  2. 取 '{' 之前的部分作为实际工具名（trim 后）
+//  3. 用括号平衡算法提取完整的 JSON 对象（自动忽略尾部多余字符）
+//  4. 解析 JSON 为 map[string]any，失败时尝试修复常见的 JSON 错误
+//
+// 返回值：
+//   - actualName: 真正的工具名（已 trim）
+//   - args: 解析出的参数 map（ok=true 时不为 nil）
+//   - ok: 是否成功从 name 中提取出嵌入参数
+//
+// 如果 name 中没有 '{'、'{' 在首位（无工具名前缀）、或 JSON 解析失败，
+// 返回 (原 name, nil, false)。
+func extractEmbeddedArgsFromName(name string) (actualName string, args map[string]any, ok bool) {
+	braceIdx := strings.Index(name, "{")
+	if braceIdx <= 0 { // '{' 不存在或在首位（无工具名前缀）
+		return name, nil, false
+	}
+	candidate := strings.TrimSpace(name[:braceIdx])
+	if candidate == "" {
+		return name, nil, false
+	}
+	jsonPart := name[braceIdx:]
+	// 用括号平衡算法提取第一个完整的 JSON 对象，自动忽略尾部多余字符
+	argsStr, _ := tools.ExtractCallArgsBalanced(jsonPart)
+	if argsStr == "" {
+		return candidate, nil, false
+	}
+	parsed := tools.TryParseJSON(argsStr)
+	if parsed == nil {
+		// 尝试修复常见的 JSON 错误（如尾随逗号）
+		fixed := tools.FixCommonJsonErrors(argsStr)
+		parsed = tools.TryParseJSON(fixed)
+	}
+	if parsed == nil {
+		return candidate, nil, false
+	}
+	argsMap, isMap := parsed.(map[string]any)
+	if !isMap {
+		// JSON 解析为非 map 类型（如数组、字符串），包装为 map
+		argsMap = map[string]any{"value": parsed}
+	}
+	return candidate, argsMap, true
+}
+
+// argumentsIsEmpty 判断 tool_calls.arguments 字段的值是否视为空。
+// 支持三种类型：nil、string（空或 "{}"）、map（长度为 0）。
+func argumentsIsEmpty(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		trimmed := strings.TrimSpace(x)
+		return trimmed == "" || trimmed == "{}"
+	case map[string]any:
+		return len(x) == 0
+	}
+	return false
+}
+
 // ConsumeEvent 消费一个 GLM SSE 事件，返回增量 chunks 和当前状态
 //
 // 处理流程：
@@ -811,6 +881,13 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						toolCallsData, _ := content["tool_calls"].(map[string]any)
 						toolName, _ := toolCallsData["name"].(string)
 						toolName = strings.TrimSpace(toolName)
+						// 兼容 GLM 服务端将参数嵌入 name 字段的异常格式
+						// 如 name = `Read{"file_path":"..."}`，需要分离出真正的工具名和参数
+						var embeddedArgs map[string]any
+						if actualName, args, ok := extractEmbeddedArgsFromName(toolName); ok {
+							toolName = actualName
+							embeddedArgs = args
+						}
 						// GLM 内部的 open_url 工具在 API 层映射为 read
 						if toolName == "finish" {
 							continue
@@ -821,6 +898,11 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						toolID, _ := toolCallsData["id"].(string)
 						toolID = strings.TrimSpace(toolID)
 						arguments := toolCallsData["arguments"]
+						// 如果 arguments 为空但 name 中嵌入了参数，使用嵌入的参数
+						if argumentsIsEmpty(arguments) && embeddedArgs != nil {
+							arguments = embeddedArgs
+							a.Logger.Debug("使用 name 中嵌入的参数作为 arguments", "toolName", toolName)
+						}
 						// 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）
 						argsStr := "{}"
 						if s, ok := arguments.(string); ok {

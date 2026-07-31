@@ -176,3 +176,240 @@ func TestConsumeEventToolCallComplete(t *testing.T) {
 	}
 	_ = status
 }
+
+// TestExtractEmbeddedArgsFromName 验证从 name 字段中分离嵌入参数的逻辑
+func TestExtractEmbeddedArgsFromName(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantName   string
+		wantArgs   map[string]any
+		wantOk     bool
+	}{
+		{
+			name:     "标准嵌入参数",
+			input:    `Read{"file_path":"e:\\test.txt"}`,
+			wantName: "Read",
+			wantArgs: map[string]any{"file_path": "e:\\test.txt"},
+			wantOk:   true,
+		},
+		{
+			name:     "含多余尾部字符（用户日志场景）",
+			input:    `Read{"file_path":"c:\\Users\\wkf\\.trae-cn\\skills\\report.md"}}`,
+			wantName: "Read",
+			wantArgs: map[string]any{"file_path": "c:\\Users\\wkf\\.trae-cn\\skills\\report.md"},
+			wantOk:   true,
+		},
+		{
+			name:     "open_url 工具嵌入参数",
+			input:    `open_url{"url":"https://example.com"}`,
+			wantName: "open_url",
+			wantArgs: map[string]any{"url": "https://example.com"},
+			wantOk:   true,
+		},
+		{
+			name:     "多参数嵌入",
+			input:    `Edit{"file_path":"/a/b.go","old_string":"x","new_string":"y"}`,
+			wantName: "Edit",
+			wantArgs: map[string]any{
+				"file_path":   "/a/b.go",
+				"old_string":  "x",
+				"new_string":  "y",
+			},
+			wantOk: true,
+		},
+		{
+			name:     "尾随逗号自动修复",
+			input:    `Read{"file_path":"/a/b.go",}`,
+			wantName: "Read",
+			wantArgs: map[string]any{"file_path": "/a/b.go"},
+			wantOk:   true,
+		},
+		{
+			name:     "纯工具名无嵌入参数",
+			input:    "Read",
+			wantName: "Read",
+			wantArgs: nil,
+			wantOk:   false,
+		},
+		{
+			name:     "空字符串",
+			input:    "",
+			wantName: "",
+			wantArgs: nil,
+			wantOk:   false,
+		},
+		{
+			name:     "JSON 在首位无工具名前缀",
+			input:    `{"file_path":"/a/b.go"}`,
+			wantName: `{"file_path":"/a/b.go"}`,
+			wantArgs: nil,
+			wantOk:   false,
+		},
+		{
+			name:     "工具名带前后空格",
+			input:    `  Read  {"file_path":"/a/b.go"}`,
+			wantName: "Read",
+			wantArgs: map[string]any{"file_path": "/a/b.go"},
+			wantOk:   true,
+		},
+		{
+			name:     "无效 JSON 不返回参数",
+			input:    `Read{invalid json}`,
+			wantName: "Read",
+			wantArgs: nil,
+			wantOk:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotArgs, gotOk := extractEmbeddedArgsFromName(tt.input)
+			if gotName != tt.wantName {
+				t.Errorf("name = %q, want %q", gotName, tt.wantName)
+			}
+			if gotOk != tt.wantOk {
+				t.Errorf("ok = %v, want %v", gotOk, tt.wantOk)
+			}
+			if tt.wantOk {
+				if gotArgs == nil {
+					t.Fatalf("args is nil, want non-nil")
+				}
+				if len(gotArgs) != len(tt.wantArgs) {
+					t.Errorf("args length = %d, want %d (got=%v, want=%v)",
+						len(gotArgs), len(tt.wantArgs), gotArgs, tt.wantArgs)
+				}
+				for k, wantV := range tt.wantArgs {
+					if gotV, exists := gotArgs[k]; !exists {
+						t.Errorf("args missing key %q", k)
+					} else if gotV != wantV {
+						t.Errorf("args[%q] = %v, want %v", k, gotV, wantV)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestArgumentsIsEmpty 验证判断 arguments 是否为空的逻辑
+func TestArgumentsIsEmpty(t *testing.T) {
+	tests := []struct {
+		name string
+		input any
+		want  bool
+	}{
+		{"nil", nil, true},
+		{"空字符串", "", true},
+		{"空白字符串", "   ", true},
+		{"空对象字符串", "{}", true},
+		{"带空格空对象", "  {}  ", true},
+		{"空map", map[string]any{}, true},
+		{"非空字符串", `{"file_path":"/a"}`, false},
+		{"非空map", map[string]any{"file_path": "/a"}, false},
+		{"其他类型（数字）", 42, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := argumentsIsEmpty(tt.input); got != tt.want {
+				t.Errorf("argumentsIsEmpty(%v) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestConsumeEventServerSideToolCallWithEmbeddedArgs 验证服务端工具调用参数嵌入 name 字段的兼容场景
+// 复现用户日志中的格式：name = `Read{"file_path":"..."}}`，arguments 为空
+func TestConsumeEventServerSideToolCallWithEmbeddedArgs(t *testing.T) {
+	acc := NewGLMEventAccumulator("model", "", nil, false, nil)
+
+	// 构造 GLM 服务端返回的 tool_calls 数据：name 中嵌入参数，arguments 为空
+	event := map[string]any{
+		"conversation_id": "test-conv",
+		"parts": []any{
+			map[string]any{
+				"logic_id": "part1",
+				"content": []any{
+					map[string]any{
+						"type": "tool_calls",
+						"tool_calls": map[string]any{
+							"id":        "tool-1",
+							"name":      `Read{"file_path":"e:\\test.txt"}}`,
+							"arguments": map[string]any{},
+						},
+					},
+				},
+			},
+		},
+		"status": "processing",
+	}
+
+	acc.ConsumeEvent(event)
+
+	if !acc.toolParser.IsToolCallCompleted() {
+		t.Fatal("expected toolParser.IsToolCallCompleted() to be true after server-side tool call")
+	}
+	if len(acc.serverSideToolCalls) != 1 {
+		t.Fatalf("expected 1 server-side tool call, got %d", len(acc.serverSideToolCalls))
+	}
+
+	tc := acc.serverSideToolCalls[0]
+	fn, _ := tc["function"].(map[string]any)
+	name, _ := fn["name"].(string)
+	args, _ := fn["arguments"].(string)
+
+	if name != "Read" {
+		t.Errorf("tool name = %q, want %q", name, "Read")
+	}
+	if !strings.Contains(args, "file_path") {
+		t.Errorf("expected args to contain file_path, got %q", args)
+	}
+	if !strings.Contains(args, "e:\\\\test.txt") {
+		t.Errorf("expected args to contain the file path, got %q", args)
+	}
+}
+
+// TestConsumeEventServerSideToolCallPrefersExplicitArguments 验证当 arguments 字段非空时优先使用它
+func TestConsumeEventServerSideToolCallPrefersExplicitArguments(t *testing.T) {
+	acc := NewGLMEventAccumulator("model", "", nil, false, nil)
+
+	// name 中嵌入参数，但 arguments 字段提供了不同的参数 → 应优先使用 arguments
+	event := map[string]any{
+		"conversation_id": "test-conv",
+		"parts": []any{
+			map[string]any{
+				"logic_id": "part1",
+				"content": []any{
+					map[string]any{
+						"type": "tool_calls",
+						"tool_calls": map[string]any{
+							"id":   "tool-1",
+							"name": `Read{"file_path":"embedded.txt"}`,
+							"arguments": map[string]any{
+								"file_path": "explicit.txt",
+							},
+						},
+					},
+				},
+			},
+		},
+		"status": "processing",
+	}
+
+	acc.ConsumeEvent(event)
+
+	if len(acc.serverSideToolCalls) != 1 {
+		t.Fatalf("expected 1 server-side tool call, got %d", len(acc.serverSideToolCalls))
+	}
+
+	tc := acc.serverSideToolCalls[0]
+	fn, _ := tc["function"].(map[string]any)
+	args, _ := fn["arguments"].(string)
+
+	// 应使用 explicit.txt 而非 embedded.txt
+	if !strings.Contains(args, "explicit.txt") {
+		t.Errorf("expected args to prefer explicit arguments, got %q", args)
+	}
+	if strings.Contains(args, "embedded.txt") {
+		t.Errorf("should not use embedded args when explicit arguments provided, got %q", args)
+	}
+}
