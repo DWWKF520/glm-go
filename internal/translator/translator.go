@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -189,6 +190,121 @@ func ExtractRecentUserURL(messages []map[string]any) string {
 	return ""
 }
 
+// buildToolParamTypeMap 从工具定义列表中构建工具名称到参数类型映射
+//
+// 工具定义格式（OpenAI 格式）：
+//
+//	{
+//	  "type": "function",
+//	  "function": {
+//	    "name": "tool_name",
+//	    "parameters": {
+//	      "type": "object",
+//	      "properties": {
+//	        "param1": { "type": "integer" },
+//	        "param2": { "type": "string" }
+//	      }
+//	    }
+//	  }
+//	}
+//
+// 返回格式：map[工具名]map[参数名]参数类型字符串
+func buildToolParamTypeMap(toolsList []map[string]any) map[string]map[string]string {
+	result := make(map[string]map[string]string)
+	if len(toolsList) == 0 {
+		return result
+	}
+	for _, tool := range toolsList {
+		fn, _ := tool["function"].(map[string]any)
+		if fn == nil {
+			continue
+		}
+		toolName := strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
+		if toolName == "" {
+			continue
+		}
+		parameters, _ := fn["parameters"].(map[string]any)
+		if parameters == nil {
+			continue
+		}
+		properties, _ := parameters["properties"].(map[string]any)
+		if properties == nil {
+			continue
+		}
+		paramTypes := make(map[string]string)
+		for paramName, paramDef := range properties {
+			paramDefMap, _ := paramDef.(map[string]any)
+			if paramDefMap == nil {
+				continue
+			}
+			if paramType, ok := paramDefMap["type"].(string); ok {
+				paramTypes[paramName] = paramType
+			}
+		}
+		result[toolName] = paramTypes
+	}
+	return result
+}
+
+// coerceParamValue 根据参数类型 schema 矫正参数值
+//
+// 处理模型常见的类型错误：
+//   - integer/number 类型：字符串 "5" → 数字 5
+//   - boolean 类型：字符串 "true"/"false" → 布尔值
+//
+// 参数：
+//   - value: 原始参数值
+//   - expectedType: 期望的参数类型（如 "integer", "number", "boolean"）
+//
+// 返回矫正后的值，如果无法转换则返回原值
+func coerceParamValue(value any, expectedType string) any {
+	switch expectedType {
+	case "integer":
+		// 字符串 → 整数
+		if s, ok := value.(string); ok {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return value
+			}
+			// 尝试解析为整数
+			if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return i
+			}
+			// 尝试解析为浮点数后取整（处理 "5.0" 这种情况）
+			if f, err := strconv.ParseFloat(s, 64); err == nil {
+				return int64(f)
+			}
+		}
+		// 浮点数 → 整数（处理 JSON 解析为 float64 的情况）
+		if f, ok := value.(float64); ok {
+			return int64(f)
+		}
+	case "number":
+		// 字符串 → 浮点数
+		if s, ok := value.(string); ok {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return value
+			}
+			if f, err := strconv.ParseFloat(s, 64); err == nil {
+				return f
+			}
+		}
+	case "boolean":
+		// 字符串 → 布尔值
+		if s, ok := value.(string); ok {
+			s = strings.ToLower(strings.TrimSpace(s))
+			switch s {
+			case "true", "1", "yes":
+				return true
+			case "false", "0", "no":
+				return false
+			}
+		}
+	}
+	return value
+}
+
 // SanitizeToolCallPayload 清理单个工具调用的参数
 //
 // 处理逻辑：
@@ -198,9 +314,10 @@ func ExtractRecentUserURL(messages []map[string]any) string {
 //  4. 处理 GLM 模型常见的参数格式错误：
 //     - {"param_name": "url"} → 用 fallbackURL 替代
 //     - {"param_name": ..., "param_value": ...} → 清理无效参数
+//  5. 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）
 //
 // 返回清理后的参数 map，若工具调用应被丢弃则返回 nil
-func SanitizeToolCallPayload(toolName string, arguments any, fallbackURL string) map[string]any {
+func SanitizeToolCallPayload(toolName string, arguments any, fallbackURL string, paramTypes map[string]string) map[string]any {
 	parsedArguments := arguments
 	if s, ok := arguments.(string); ok {
 		var v any
@@ -243,6 +360,18 @@ func SanitizeToolCallPayload(toolName string, arguments any, fallbackURL string)
 		}
 	}
 
+	// 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）
+	if len(paramTypes) > 0 {
+		for k, v := range cleaned {
+			if expectedType, ok := paramTypes[k]; ok {
+				if paramTypes[k] == "id" {
+					continue
+				}
+				cleaned[k] = coerceParamValue(v, expectedType)
+			}
+		}
+	}
+
 	return cleaned
 }
 
@@ -252,11 +381,20 @@ func SanitizeToolCallPayload(toolName string, arguments any, fallbackURL string)
 //  1. 提取并验证工具名称（空名称的调用被跳过）
 //  2. 调用 SanitizeToolCallPayload 清理参数
 //  3. 移除参数中的本地文件提示（removeLocalFileHint）
-//  4. 检测参数是否被修复（_repaired 标记）
-//  5. 生成标准格式的工具调用对象
+//  4. 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）
+//  5. 检测参数是否被修复（_repaired 标记）
+//  6. 生成标准格式的工具调用对象
+//
+// 参数：
+//   - toolCalls: 原始工具调用列表
+//   - fallbackURL: 备用 URL（用于修复参数格式错误）
+//   - toolsList: 工具定义列表（用于提取参数类型信息进行类型矫正）
 //
 // 返回清理后的工具调用列表
-func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string) []map[string]any {
+func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string, toolsList []map[string]any) []map[string]any {
+	// 构建工具名称到参数类型映射
+	toolParamTypes := buildToolParamTypeMap(toolsList)
+
 	var sanitized []map[string]any
 	for i, tc := range toolCalls {
 		fn, _ := tc["function"].(map[string]any)
@@ -277,7 +415,9 @@ func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string) []map[str
 				originalValue = s
 			}
 		}
-		cleanedArguments := SanitizeToolCallPayload(toolName, originalArguments, fallbackURL)
+		// 获取该工具的参数类型映射
+		paramTypes := toolParamTypes[toolName]
+		cleanedArguments := SanitizeToolCallPayload(toolName, originalArguments, fallbackURL, paramTypes)
 		if cleanedArguments == nil {
 			continue
 		}
@@ -389,8 +529,8 @@ func ConvertMessages(
 						rawCallsList = append(rawCallsList, m)
 					}
 				}
-				// 清理工具调用参数（修复模型输出的格式错误）
-				sanitizedToolCalls := SanitizeToolCalls(rawCallsList, latestUserURL)
+				// 清理工具调用参数（修复模型输出的格式错误，包括类型矫正）
+				sanitizedToolCalls := SanitizeToolCalls(rawCallsList, latestUserURL, toolsList)
 				for _, tc := range sanitizedToolCalls {
 					fn, _ := tc["function"].(map[string]any)
 					toolName := "unknown"
@@ -538,12 +678,13 @@ func ConvertMessages(
 //   - 生成符合 OpenAI SSE 规范的 JSON chunks
 type GLMEventAccumulator struct {
 	// 公开字段
-	Model           string       // 模型名称（如 "glm-4-flash"）
-	FallbackToolURL string       // 工具调用的 fallback URL（来自用户消息）
-	DebugEnabled    bool         // 是否启用调试日志
-	Logger          *slog.Logger // 日志记录器
-	ConversationID  string       // GLM 会话 ID（从第一个事件中提取）
-	Created         int64        // 响应创建时间戳（Unix 秒）
+	Model           string           // 模型名称（如 "glm-4-flash"）
+	FallbackToolURL string           // 工具调用的 fallback URL（来自用户消息）
+	ToolsList       []map[string]any // 工具定义列表（用于参数类型矫正）
+	DebugEnabled    bool             // 是否启用调试日志
+	Logger          *slog.Logger     // 日志记录器
+	ConversationID  string           // GLM 会话 ID（从第一个事件中提取）
+	Created         int64            // 响应创建时间戳（Unix 秒）
 
 	// parts 管理
 	partsByLogicID            map[string]map[string]any // logic_id → part 数据
@@ -577,14 +718,16 @@ type GLMEventAccumulator struct {
 //   - model: 模型名称
 //   - fallbackToolURL: 工具调用的 fallback URL（通常来自用户消息中的 URL）
 //   - debugEnabled: 是否启用调试日志
+//   - toolsList: 工具定义列表（用于参数类型矫正）
 //   - logger: 日志记录器（nil 时使用空 logger）
-func NewGLMEventAccumulator(model string, fallbackToolURL string, debugEnabled bool, logger *slog.Logger) *GLMEventAccumulator {
+func NewGLMEventAccumulator(model string, fallbackToolURL string, toolsList []map[string]any, debugEnabled bool, logger *slog.Logger) *GLMEventAccumulator {
 	if logger == nil {
 		logger = logging.GetLogger("glm2api.null")
 	}
 	acc := &GLMEventAccumulator{
 		Model:                 model,
 		FallbackToolURL:       fallbackToolURL,
+		ToolsList:             toolsList,
 		DebugEnabled:          debugEnabled,
 		Logger:                logger,
 		Created:               time.Now().Unix(),
@@ -785,12 +928,8 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) []string {
 	// 刷新工具解析器，获取剩余文本和解析出的工具调用
 	tailText, jsonToolCalls := a.toolParser.Flush()
-	jsonToolCalls = SanitizeToolCalls(jsonToolCalls, a.FallbackToolURL)
-	// 如果 JSON 解析没有工具调用，尝试从推理内容中提取
-	if len(jsonToolCalls) == 0 {
-		jsonToolCalls = a.extractReasoningToolCalls("")
-	}
-
+	a.Logger.Info("finalize: tool parser flush", "tailText", tailText, "jsonToolCalls", jsonToolCalls)
+	jsonToolCalls = SanitizeToolCalls(jsonToolCalls, a.FallbackToolURL, a.ToolsList)
 	// 合并服务端工具调用和 JSON 工具调用，重新索引
 	allToolCalls := make([]map[string]any, len(a.serverSideToolCalls))
 	copy(allToolCalls, a.serverSideToolCalls)
@@ -821,7 +960,7 @@ func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) 
 	if len(allToolCalls) == 0 && finalText != "" {
 		recoveredClean, recoveredCalls := tools.ParseToolCallsFromText(finalText)
 		if len(recoveredCalls) > 0 {
-			sanitizedRecovered := SanitizeToolCalls(recoveredCalls, a.FallbackToolURL)
+			sanitizedRecovered := SanitizeToolCalls(recoveredCalls, a.FallbackToolURL, a.ToolsList)
 			if len(sanitizedRecovered) > 0 {
 				for _, tc := range sanitizedRecovered {
 					tcCopy := map[string]any{}
@@ -960,7 +1099,7 @@ func (a *GLMEventAccumulator) extractReasoningToolCalls(reasoningText string) []
 		return nil
 	}
 	_, toolCalls := tools.ParseToolCallsFromText(strings.TrimSpace(source))
-	return SanitizeToolCalls(toolCalls, a.FallbackToolURL)
+	return SanitizeToolCalls(toolCalls, a.FallbackToolURL, a.ToolsList)
 }
 
 // computeDeltas 计算本次事件相对于上次的文本和推理内容增量

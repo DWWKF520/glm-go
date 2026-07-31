@@ -124,7 +124,7 @@ func TestExtractTextContentFiltersEmpty(t *testing.T) {
 
 // TestConsumeEventToolCallComplete 验证工具调用完成后后续事件返回 tool_call_complete
 func TestConsumeEventToolCallComplete(t *testing.T) {
-	acc := NewGLMEventAccumulator("model", "", false, nil)
+	acc := NewGLMEventAccumulator("model", "", nil, false, nil)
 
 	// 构造一个包含完整 tool_code 块的事件
 	toolBlock := "```tool_code\n" +

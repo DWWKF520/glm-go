@@ -271,9 +271,13 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 		return nil, err
 	}
 
+	// 获取工具定义列表（用于参数类型矫正）
+	filteredTools := c.resolveTools(payload)
+
 	accumulator := translator.NewGLMEventAccumulator(
 		fmt.Sprintf("%v", payload["model"]),
 		translator.ExtractRecentUserURL(getMessagesList(payload)),
+		filteredTools,
 		c.config.DebugDumpAll,
 		c.logger,
 	)
@@ -343,6 +347,7 @@ func (c *Client) GenerateImages(ctx context.Context, payload map[string]any) (ma
 	accumulator := translator.NewGLMEventAccumulator(
 		getModelName(payload, c.config.GLMImageModelName),
 		"",
+		nil, // 图片生成无需工具定义
 		c.config.DebugDumpAll,
 		c.logger,
 	)
