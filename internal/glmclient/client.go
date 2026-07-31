@@ -468,7 +468,6 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 	convertedMessages := translator.ConvertMessages(
 		getMessagesList(openaiPayload),
 		filteredTools,
-		openaiPayload["tool_choice"],
 		tools.ServerSideToolNames,
 	)
 

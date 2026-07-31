@@ -472,7 +472,6 @@ func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string, toolsList
 func ConvertMessages(
 	messages []map[string]any,
 	toolsList []map[string]any,
-	toolChoice any,
 	serverSideToolNames map[string]bool,
 ) []map[string]any {
 	// 构建可用工具名称集合
@@ -490,7 +489,6 @@ func ConvertMessages(
 	if serverSideToolNames == nil {
 		serverSideToolNames = tools.ServerSideToolNames
 	}
-	toolChoicePolicy := tools.ParseToolChoicePolicy(toolChoice, availableToolNames)
 
 	type processedItem struct {
 		role    string
@@ -621,9 +619,9 @@ func ConvertMessages(
 
 	// 拼接完整提示词：工具定义 + 对话历史
 	var transcriptParts []string
-	if len(toolsList) > 0 && toolChoicePolicy.Mode != "none" {
+	if len(toolsList) > 0 {
 		transcriptParts = append(transcriptParts,
-			tools.ToolsToPrompt(toolsList, toolChoicePolicy, serverSideToolNames),
+			tools.ToolsToPrompt(toolsList, serverSideToolNames),
 			"# CONVERSATION",
 		)
 	}
