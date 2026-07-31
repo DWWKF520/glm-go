@@ -364,7 +364,7 @@ func SanitizeToolCallPayload(toolName string, arguments any, fallbackURL string,
 	if len(paramTypes) > 0 {
 		for k, v := range cleaned {
 			if expectedType, ok := paramTypes[k]; ok {
-				if paramTypes[k] == "id" {
+				if k == "id" {
 					continue
 				}
 				cleaned[k] = coerceParamValue(v, expectedType)
@@ -823,24 +823,41 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						toolID, _ := toolCallsData["id"].(string)
 						toolID = strings.TrimSpace(toolID)
 						arguments := toolCallsData["arguments"]
-						if toolName == "WebSearch" {
-							if argsMap, ok := arguments.(map[string]any); ok {
-								if numVal, exists := argsMap["num"]; exists {
-									if numStr, ok := numVal.(string); ok {
-										var numInt int
-										if _, err := fmt.Sscanf(numStr, "%d", &numInt); err == nil {
-											argsMap["num"] = numInt
+						// 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）
+						argsStr := "{}"
+						if s, ok := arguments.(string); ok {
+							// string 类型：先解析为 map，矫正后再序列化
+							var parsed map[string]any
+							if err := sonic.UnmarshalString(s, &parsed); err == nil && parsed != nil {
+								toolParamTypes := buildToolParamTypeMap(a.ToolsList)
+								if paramTypes, exists := toolParamTypes[toolName]; exists {
+									for k, v := range parsed {
+										if expectedType, ok := paramTypes[k]; ok {
+											if k == "id" {
+												continue
+											}
+											parsed[k] = coerceParamValue(v, expectedType)
 										}
 									}
 								}
+								argsStr = tools.SafeJSONDumpsCompact(parsed)
+							} else {
+								argsStr = s
 							}
-						}
-
-						argsStr := "{}"
-						if s, ok := arguments.(string); ok {
-							argsStr = s
-						} else {
-							argsStr = tools.SafeJSONDumpsCompact(arguments)
+						} else if argsMap, ok := arguments.(map[string]any); ok {
+							// map 类型：直接矫正
+							toolParamTypes := buildToolParamTypeMap(a.ToolsList)
+							if paramTypes, exists := toolParamTypes[toolName]; exists {
+								for k, v := range argsMap {
+									if expectedType, ok := paramTypes[k]; ok {
+										if k == "id" {
+											continue
+										}
+										argsMap[k] = coerceParamValue(v, expectedType)
+									}
+								}
+							}
+							argsStr = tools.SafeJSONDumpsCompact(argsMap)
 						}
 
 						// 去重：同一个 toolID 只记录一次
