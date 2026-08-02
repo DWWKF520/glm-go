@@ -653,7 +653,6 @@ func ConvertMessages(
 			"# CONVERSATION",
 		)
 	}
-
 	// 格式化对话历史：每条消息以角色名开头
 	for _, item := range processed {
 		title := item.role

@@ -92,8 +92,10 @@ func ArgumentsIsEmpty(v any) bool {
 //
 // 正常情况下 GLM 返回的 tool_calls.name 应为纯工具名（如 "Read"），
 // 但实际观察中会出现将参数 JSON 直接拼接在 name 后的情况，例如：
-//   name = `Read{"file_path":"C:\\path\\file.txt"}`
-//   name = `open_url{"url":"https://example.com"}}`  （含多余尾部字符）
+//
+//	name = `Read{"file_path":"C:\\path\\file.txt"}`
+//	name = `open_url{"url":"https://example.com"}}`  （含多余尾部字符）
+//
 // 同时 arguments 字段为空或 {}。
 //
 // 本函数从 name 中分离出真正的工具名和嵌入的参数：
@@ -194,7 +196,7 @@ func ToolsToPrompt(tools []map[string]any, serverSideToolNames map[string]bool) 
 
 	parts := []string{
 		"# TOOL SCHEMAS",
-		"Use ONLY the tools defined below. Obey the protocol rules that follow.",
+		"记住，你本身没有以下调用工具的能力，只是通过[function_calls]模拟工具调用，然后第三方解析模拟的工具调用结果返回tool_result",
 		"",
 		strings.Join(toolSchemas, "\n\n"),
 	}
