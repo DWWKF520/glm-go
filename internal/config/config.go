@@ -57,34 +57,35 @@ func NewConfigError(msg string) error { return &ConfigError{msg: msg} }
 
 // AppConfig 应用配置
 type AppConfig struct {
-	EnvFile                 string
-	EnvFileCreated          bool
-	TokenFile               string
-	Host                    string
-	Port                    int
-	APIPrefix               string
-	LogLevel                string
-	LogFile                 string
-	DebugDumpAll            bool
-	RequestTimeout          int
-	GLMBaseURL              string
-	GLMUseGuestRefreshToken bool
-	GLMRefreshToken         string
-	GLMRefreshTokens        []string
-	GLMAssistantID          string
-	GLMImageAssistantID     string
-	GLMImageModelName       string
-	GLMUserAgent            string
-	GLMDeleteConversation   bool
-	GLMMaxConcurrency       int
-	GLMQueueWaitTimeout     int
-	GLMBusyMaxRetries       int
-	GLMBusyRetryInterval    float64
-	GLMGuestMaxRetries      int
-	ExposedModels           []string
-	ModelAliases            map[string]string
-	ServerAPIKeys           []string
-	CORSAllowOrigin         string
+	EnvFile                     string
+	EnvFileCreated              bool
+	TokenFile                   string
+	Host                        string
+	Port                        int
+	APIPrefix                   string
+	LogLevel                    string
+	LogFile                     string
+	DebugDumpAll                bool
+	RequestTimeout              int
+	GLMBaseURL                  string
+	GLMUseGuestRefreshToken     bool
+	GLMRefreshToken             string
+	GLMRefreshTokens            []string
+	GLMAssistantID              string
+	GLMImageAssistantID         string
+	GLMImageModelName           string
+	GLMUserAgent                string
+	GLMDeleteConversation       bool
+	GLMMaxConcurrency           int
+	GLMQueueWaitTimeout         int
+	GLMBusyMaxRetries           int
+	GLMBusyRetryInterval        float64
+	GLMGuestMaxRetries          int
+	GLMStreamContinueMaxRetries int
+	ExposedModels               []string
+	ModelAliases                map[string]string
+	ServerAPIKeys               []string
+	CORSAllowOrigin             string
 }
 
 // RefreshURL 刷新 token URL
@@ -100,6 +101,12 @@ func (c *AppConfig) GuestRefreshURL() string {
 // ChatStreamURL 聊天流式 URL
 func (c *AppConfig) ChatStreamURL() string {
 	return c.GLMBaseURL + "/backend-api/assistant/stream"
+}
+
+// ContinueStreamURL 续流 URL
+// 当 SSE 流中途断开时，通过该接口携带 history_id（最后一个事件的 id 字段）从断点继续未完成的响应
+func (c *AppConfig) ContinueStreamURL() string {
+	return c.GLMBaseURL + "/mainchat-api/stream/continue_stream"
 }
 
 // DeleteConversationURL 删除会话 URL
@@ -398,35 +405,44 @@ func LoadConfig(envFile string) (*AppConfig, error) {
 		guestMaxRetries = 0
 	}
 
+	streamContinueMaxRetries, err := ParseInt(values["GLM_STREAM_CONTINUE_MAX_RETRIES"], 3)
+	if err != nil {
+		return nil, err
+	}
+	if streamContinueMaxRetries < 0 {
+		streamContinueMaxRetries = 0
+	}
+
 	defaultUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
 
 	config := &AppConfig{
-		EnvFile:                 envPath,
-		EnvFileCreated:          envFileCreated,
-		TokenFile:               tokenFile,
-		Host:                    host,
-		Port:                    port,
-		APIPrefix:               apiPrefix,
-		LogLevel:                logLevel,
-		LogFile:                 logFilePath,
-		DebugDumpAll:            debugDumpAll,
-		RequestTimeout:          requestTimeout,
-		GLMBaseURL:              strings.TrimRight(getOrDefault(values, "GLM_BASE_URL", DefaultGLMBaseURL), "/"),
-		GLMUseGuestRefreshToken: explicitGuestMode,
-		GLMRefreshToken:         singleRefreshToken,
-		GLMRefreshTokens:        refreshTokens,
-		GLMAssistantID:          strings.TrimSpace(getOrDefault(values, "GLM_ASSISTANT_ID", DefaultAssistantID)),
-		GLMImageAssistantID:     strings.TrimSpace(getOrDefault(values, "GLM_IMAGE_ASSISTANT_ID", DefaultImageAssistantID)),
-		GLMImageModelName:       imageModelName,
-		GLMUserAgent:            strings.TrimSpace(getOrDefault(values, "GLM_USER_AGENT", defaultUA)),
-		GLMDeleteConversation:   ParseBool(values["GLM_DELETE_CONVERSATION"], true),
-		GLMMaxConcurrency:       glmMaxConcurrency,
-		GLMQueueWaitTimeout:     queueWaitTimeout,
-		GLMBusyMaxRetries:       busyMaxRetries,
-		GLMBusyRetryInterval:    busyRetryInterval,
-		GLMGuestMaxRetries:      guestMaxRetries,
-		ServerAPIKeys:           ParseList(values["SERVER_API_KEYS"], nil),
-		CORSAllowOrigin:         getOrDefault(values, "CORS_ALLOW_ORIGIN", "*"),
+		EnvFile:                     envPath,
+		EnvFileCreated:              envFileCreated,
+		TokenFile:                   tokenFile,
+		Host:                        host,
+		Port:                        port,
+		APIPrefix:                   apiPrefix,
+		LogLevel:                    logLevel,
+		LogFile:                     logFilePath,
+		DebugDumpAll:                debugDumpAll,
+		RequestTimeout:              requestTimeout,
+		GLMBaseURL:                  strings.TrimRight(getOrDefault(values, "GLM_BASE_URL", DefaultGLMBaseURL), "/"),
+		GLMUseGuestRefreshToken:     explicitGuestMode,
+		GLMRefreshToken:             singleRefreshToken,
+		GLMRefreshTokens:            refreshTokens,
+		GLMAssistantID:              strings.TrimSpace(getOrDefault(values, "GLM_ASSISTANT_ID", DefaultAssistantID)),
+		GLMImageAssistantID:         strings.TrimSpace(getOrDefault(values, "GLM_IMAGE_ASSISTANT_ID", DefaultImageAssistantID)),
+		GLMImageModelName:           imageModelName,
+		GLMUserAgent:                strings.TrimSpace(getOrDefault(values, "GLM_USER_AGENT", defaultUA)),
+		GLMDeleteConversation:       ParseBool(values["GLM_DELETE_CONVERSATION"], true),
+		GLMMaxConcurrency:           glmMaxConcurrency,
+		GLMQueueWaitTimeout:         queueWaitTimeout,
+		GLMBusyMaxRetries:           busyMaxRetries,
+		GLMBusyRetryInterval:        busyRetryInterval,
+		GLMGuestMaxRetries:          guestMaxRetries,
+		GLMStreamContinueMaxRetries: streamContinueMaxRetries,
+		ServerAPIKeys:               ParseList(values["SERVER_API_KEYS"], nil),
+		CORSAllowOrigin:             getOrDefault(values, "CORS_ALLOW_ORIGIN", "*"),
 	}
 
 	if config.Port < 1 || config.Port > 65535 {
