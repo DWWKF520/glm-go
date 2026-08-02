@@ -247,6 +247,26 @@ func buildToolParamTypeMap(toolsList []map[string]any) map[string]map[string]str
 	return result
 }
 
+// extractToolNames 从工具定义列表中提取所有工具名称，用于辅助从 name 字段中分离嵌入的工具名和参数名。
+// 返回工具名称字符串切片；输入为空返回 nil。
+func extractToolNames(toolsList []map[string]any) []string {
+	if len(toolsList) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(toolsList))
+	for _, tool := range toolsList {
+		fn, _ := tool["function"].(map[string]any)
+		if fn == nil {
+			continue
+		}
+		name := strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
+		if name != "" && name != "<nil>" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
 // coerceParamValue 根据参数类型 schema 矫正参数值
 //
 // 处理模型常见的类型错误：
@@ -843,9 +863,10 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						toolName, _ := toolCallsData["name"].(string)
 						toolName = strings.TrimSpace(toolName)
 						// 兼容 GLM 服务端将参数嵌入 name 字段的异常格式
-						// 如 name = `Read{"file_path":"..."}`，需要分离出真正的工具名和参数
+						// 如 name = `Read{"file_path":"..."}` 或 `TodoWritetodos[{...}]`
+						// 需要分离出真正的工具名和参数
 						var embeddedArgs map[string]any
-						if actualName, args, ok := tools.ExtractEmbeddedArgsFromName(toolName); ok {
+						if actualName, args, ok := tools.ExtractEmbeddedArgsFromName(toolName, extractToolNames(a.ToolsList)...); ok {
 							toolName = actualName
 							embeddedArgs = args
 						}

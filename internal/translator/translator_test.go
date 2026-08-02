@@ -262,11 +262,49 @@ func TestExtractEmbeddedArgsFromName(t *testing.T) {
 			wantArgs: nil,
 			wantOk:   false,
 		},
+		// 数组格式：name+paramName[...]（日志场景 TodoWritetodos[...]）
+		{
+			name:     "数组格式-已知工具名前缀匹配",
+			input:    `TodoWritetodos[{"id":"1","content":"task","status":"pending","priority":"high"}]`,
+			wantName: "TodoWrite",
+			wantArgs: map[string]any{"todos": []any{map[string]any{"id": "1", "content": "task", "status": "pending", "priority": "high"}}},
+			wantOk:   true,
+		},
+		{
+			name:     "数组格式-启发式_分隔符边界分离",
+			input:    `MyTool_items[{"q":"a"}]`,
+			wantName: "MyTool",
+			wantArgs: map[string]any{"items": []any{map[string]any{"q": "a"}}},
+			wantOk:   true,
+		},
+		{
+			name:     "数组格式-空数组",
+			input:    `TodoWritetodos[]`,
+			wantName: "TodoWrite",
+			wantArgs: map[string]any{"todos": []any{}},
+			wantOk:   true,
+		},
+		{
+			name:     "数组格式-多元素数组",
+			input:    `TodoWritetodos[{"id":"1"},{"id":"2"}]`,
+			wantName: "TodoWrite",
+			wantArgs: map[string]any{"todos": []any{map[string]any{"id": "1"}, map[string]any{"id": "2"}}},
+			wantOk:   true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotName, gotArgs, gotOk := tools.ExtractEmbeddedArgsFromName(tt.input)
+			// 数组格式测试（TodoWrite+todos）需传入已知工具名才能正确分离；
+			// 带 _ 分隔符的可用启发式；对象格式不传工具名
+			var gotName string
+			var gotArgs map[string]any
+			var gotOk bool
+			if strings.Contains(tt.input, "TodoWrite") {
+				gotName, gotArgs, gotOk = tools.ExtractEmbeddedArgsFromName(tt.input, "TodoWrite")
+			} else {
+				gotName, gotArgs, gotOk = tools.ExtractEmbeddedArgsFromName(tt.input)
+			}
 			if gotName != tt.wantName {
 				t.Errorf("name = %q, want %q", gotName, tt.wantName)
 			}
@@ -284,7 +322,7 @@ func TestExtractEmbeddedArgsFromName(t *testing.T) {
 				for k, wantV := range tt.wantArgs {
 					if gotV, exists := gotArgs[k]; !exists {
 						t.Errorf("args missing key %q", k)
-					} else if gotV != wantV {
+					} else if !deepEqual(gotV, wantV) {
 						t.Errorf("args[%q] = %v, want %v", k, gotV, wantV)
 					}
 				}

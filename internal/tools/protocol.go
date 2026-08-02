@@ -95,48 +95,157 @@ func ArgumentsIsEmpty(v any) bool {
 //
 //	name = `Read{"file_path":"C:\\path\\file.txt"}`
 //	name = `open_url{"url":"https://example.com"}}`  （含多余尾部字符）
+//	name = `TodoWritetodos[{"id":"1",...}]`  （参数名+数组格式）
 //
 // 同时 arguments 字段为空或 {}。
 //
 // 本函数从 name 中分离出真正的工具名和嵌入的参数：
-//  1. 查找 name 中第一个 '{' 字符
-//  2. 取 '{' 之前的部分作为实际工具名（trim 后）
-//  3. 用括号平衡算法提取完整的 JSON 对象（自动忽略尾部多余字符）
-//  4. 用 TryParseJSONLenient 宽松解析为 map[string]any
+//  1. 优先查找 name 中第一个 '{'，用括号平衡算法提取 JSON 对象
+//  2. 若无 '{' 或提取失败，查找第一个 '['，提取 JSON 数组
+//     此时 '[' 之前的部分为 "工具名+参数名"，通过 knownToolNames 最长前缀匹配分离
+//  3. 用 TryParseJSONLenient 宽松解析
+//  4. 数组格式返回 map[string]any{paramName: arr}，对象格式直接返回 map
 //
 // 返回值：
 //   - actualName: 真正的工具名（已 trim）
 //   - args: 解析出的参数 map（ok=true 时不为 nil）
 //   - ok: 是否成功从 name 中提取出嵌入参数
 //
-// 如果 name 中没有 '{'、'{' 在首位（无工具名前缀）、或 JSON 解析失败，
+// 如果 name 中没有 '{' 或 '['、JSON 在首位（无工具名前缀）、或解析失败，
 // 返回 (原 name, nil, false)。
-func ExtractEmbeddedArgsFromName(name string) (actualName string, args map[string]any, ok bool) {
+//
+// knownToolNames 用于数组格式的工具名分离（如 "TodoWritetodos" → "TodoWrite" + "todos"），
+// 为空时退化为启发式：尝试找尾部的小驼峰参数名边界。
+func ExtractEmbeddedArgsFromName(name string, knownToolNames ...string) (actualName string, args map[string]any, ok bool) {
+	// 优先尝试对象格式：name{...}
+	// 但需排除 '[' 出现在 '{' 之前的情况（数组格式 name+param[...]）
+	// 否则会把 "TodoWritetodos[" 当作工具名
 	braceIdx := strings.Index(name, "{")
-	if braceIdx <= 0 { // '{' 不存在或在首位（无工具名前缀）
+	bracketIdx := strings.Index(name, "[")
+	if braceIdx > 0 && (bracketIdx < 0 || braceIdx < bracketIdx) {
+		candidate := strings.TrimSpace(name[:braceIdx])
+		// candidate 必须是合法工具名（仅字母数字下划线），否则可能是数组格式的前缀
+		if candidate != "" && isValidToolName(candidate) {
+			jsonPart := name[braceIdx:]
+			if argsStr, _ := ExtractCallArgsBalanced(jsonPart); argsStr != "" {
+				if parsed := TryParseJSONLenient(argsStr); parsed != nil {
+					if argsMap, isMap := parsed.(map[string]any); isMap {
+						return candidate, argsMap, true
+					}
+					// 非对象（数组、字符串等），包装为 map
+					return candidate, map[string]any{"value": parsed}, true
+				}
+			}
+			// 对象格式提取失败，返回 candidate 作为工具名（去掉无效的 JSON 部分）
+			return candidate, nil, false
+		}
+	}
+	// 数组格式：name+paramName[...]
+	if bracketIdx <= 0 {
 		return name, nil, false
 	}
-	candidate := strings.TrimSpace(name[:braceIdx])
-	if candidate == "" {
+	prefix := strings.TrimSpace(name[:bracketIdx])
+	if prefix == "" {
 		return name, nil, false
 	}
-	jsonPart := name[braceIdx:]
-	// 用括号平衡算法提取第一个完整的 JSON 对象，自动忽略尾部多余字符
-	argsStr, _ := ExtractCallArgsBalanced(jsonPart)
-	if argsStr == "" {
-		return candidate, nil, false
+	// 分离工具名和参数名
+	toolName, paramName := splitToolAndParamName(prefix, knownToolNames)
+	if toolName == "" {
+		return name, nil, false
 	}
-	// 宽松解析：自动处理尾随逗号等常见错误
-	parsed := TryParseJSONLenient(argsStr)
+	jsonPart := name[bracketIdx:]
+	arrStr, _ := ExtractFirstJSONArray(jsonPart, 0)
+	if arrStr == "" {
+		return toolName, nil, false
+	}
+	parsed := TryParseJSONLenient(arrStr)
 	if parsed == nil {
-		return candidate, nil, false
+		return toolName, nil, false
 	}
-	argsMap, isMap := parsed.(map[string]any)
-	if !isMap {
-		// JSON 解析为非 map 类型（如数组、字符串），包装为 map
-		argsMap = map[string]any{"value": parsed}
+	arr, isArr := parsed.([]any)
+	if !isArr {
+		// 非数组（如对象、字符串），包装为 map
+		return toolName, map[string]any{paramName: parsed}, true
 	}
-	return candidate, argsMap, true
+	return toolName, map[string]any{paramName: arr}, true
+}
+
+// isValidToolName 判断字符串是否为合法的工具名（含字母、数字、下划线、点、冒号、连字符）。
+// 用于在对象格式提取时排除 "TodoWritetodos[" 这种包含非法字符（如 '['）的前缀。
+func isValidToolName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '.' || r == ':' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// splitToolAndParamName 从 "ToolNameparamName" 形式的字符串中分离工具名和参数名。
+// 优先用 knownToolNames 做最长前缀匹配；无匹配时使用启发式：
+// 查找首个从大写转小写的位置（驼峰边界），如 "TodoWritetodos" → "TodoWrite" + "todos"。
+// 返回 (toolName, paramName)；无法分离返回 ("", "")。
+func splitToolAndParamName(prefix string, knownToolNames []string) (string, string) {
+	// 优先用已知工具名列表做最长前缀匹配
+	if len(knownToolNames) > 0 {
+		best := ""
+		for _, tn := range knownToolNames {
+			tn = strings.TrimSpace(tn)
+			if tn == "" {
+				continue
+			}
+			if strings.HasPrefix(prefix, tn) && len(tn) > len(best) {
+				best = tn
+			}
+		}
+		if best != "" {
+			// 去掉前缀后的部分，并去除可能存在的分隔符前缀（如 _ 或 .）
+			rest := strings.TrimLeft(prefix[len(best):], "_.")
+			if rest != "" {
+				return best, rest
+			}
+		}
+	}
+	// 启发式：找最后一个 "小写后跟大写" 的位置作为驼峰边界
+	// 如 "TodoWritetodos" → 'e'→'t' 处分割 → "TodoWrite" + "todos"
+	runes := []rune(prefix)
+	lastBoundary := -1
+	for i := 1; i < len(runes); i++ {
+		if isLower(runes[i-1]) && isUpper(runes[i]) {
+			lastBoundary = i
+		}
+	}
+	if lastBoundary > 0 {
+		toolName := strings.TrimSpace(prefix[:lastBoundary])
+		paramName := strings.TrimSpace(prefix[lastBoundary:])
+		// 参数名应以小写开头（参数名通常是小驼峰或全小写）
+		if paramName != "" && toolName != "" && isLower([]rune(paramName)[0]) {
+			return toolName, paramName
+		}
+	}
+	// 启发式：查找分隔符 _ 或 . 作为边界
+	// 如 "TodoWrite_todos" → "TodoWrite" + "todos"
+	for _, sep := range []string{"_", "."} {
+		if idx := strings.LastIndex(prefix, sep); idx > 0 {
+			toolName := strings.TrimSpace(prefix[:idx])
+			paramName := strings.TrimSpace(prefix[idx+1:])
+			if toolName != "" && paramName != "" && isLower([]rune(paramName)[0]) {
+				return toolName, paramName
+			}
+		}
+	}
+	return "", ""
+}
+
+func isUpper(r rune) bool {
+	return r >= 'A' && r <= 'Z'
+}
+
+func isLower(r rune) bool {
+	return r >= 'a' && r <= 'z'
 }
 
 // SerializeToolCallBlock 将工具调用序列化为 [function_calls] 格式的文本块。

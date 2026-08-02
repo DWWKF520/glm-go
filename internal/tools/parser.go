@@ -229,6 +229,47 @@ func ExtractCallArgsBalanced(text string) (string, int) {
 	return objText, span[1]
 }
 
+// ExtractFirstJSONArray 从 text 的 start 位置开始，提取第一个完整的 JSON 数组 [...]。
+// 使用括号深度计数和字符串状态跟踪，正确处理嵌套结构和字符串内的括号。
+// 返回提取到的 JSON 数组文本和其 [start, end) 位置；未找到返回 ("", [2]int{-1, -1})。
+// 用于从 GLM 异常输出中提取嵌入的数组参数（如 TodoWritetodos[{...}]）。
+func ExtractFirstJSONArray(text string, start int) (string, [2]int) {
+	pos := indexFrom(text, "[", start)
+	if pos == -1 {
+		return "", [2]int{-1, -1}
+	}
+	depth := 0
+	inString := false
+	escape := false
+	for i := pos; i < len(text); i++ {
+		c := text[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if c == '\\' {
+			escape = true
+			continue
+		}
+		if c == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if c == '[' {
+			depth++
+		} else if c == ']' {
+			depth--
+			if depth == 0 {
+				return text[pos : i+1], [2]int{pos, i + 1}
+			}
+		}
+	}
+	return "", [2]int{-1, -1}
+}
+
 // FixCommonJsonErrors 修复 LLM 输出中常见的 JSON 格式错误。
 // 目前主要修复：移除 } 或 ] 前的尾随逗号（例如 {"a":1,} → {"a":1}）。
 // 如果输入为空，直接返回原值。

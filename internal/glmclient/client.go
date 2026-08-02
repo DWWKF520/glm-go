@@ -337,7 +337,11 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 // 调用方负责在 scanErr != nil 且 historyID != "" 时通过 continueStream 续流。
 func (c *Client) drainStream(response *http.Response, accumulator *translator.GLMEventAccumulator, out chan<- []byte) (bool, string, error) {
 	defer response.Body.Close()
-	events, scanErrCh := c.iterSSEEvents(response.Body)
+	// 用 ctx 标记"主动结束"：收到终止状态后 cancel()，
+	// 这样 iterSSEEvents 的读流 goroutine 在 body 被关闭时不会误报 WARNING。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events, scanErrCh := c.iterSSEEvents(ctx, response.Body)
 	var historyID string
 	for event := range events {
 		if event == nil {
@@ -362,6 +366,8 @@ func (c *Client) drainStream(response *http.Response, accumulator *translator.GL
 			for _, chunk := range accumulator.Finalize(status, lastError) {
 				out <- []byte(chunk)
 			}
+			// 主动取消：通知读流 goroutine 即将关闭 body，无需记录中断告警
+			cancel()
 			return true, historyID, nil
 		}
 	}
@@ -493,8 +499,12 @@ func (c *Client) GenerateImages(ctx context.Context, payload map[string]any) (ma
 		lease.Release()
 	}()
 
+	// 用 ctx 标记"主动结束"：收到 finish 后 cancel()，
+	// 这样 iterSSEEvents 的读流 goroutine 在 body 被关闭时不会误报 WARNING。
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
 	var finalEvent map[string]any
-	events, _ := c.iterSSEEvents(response.Body)
+	events, _ := c.iterSSEEvents(streamCtx, response.Body)
 	for event := range events {
 		if event == nil {
 			continue
@@ -502,6 +512,8 @@ func (c *Client) GenerateImages(ctx context.Context, payload map[string]any) (ma
 		accumulator.ConsumeEvent(event)
 		if status, _ := event["status"].(string); status == "finish" {
 			finalEvent = event
+			// 主动取消：通知读流 goroutine 即将关闭 body，无需记录中断告警
+			streamCancel()
 			break
 		}
 	}
@@ -1041,15 +1053,19 @@ func (c *Client) downloadImageAsBase64(imageURL string) (string, error) {
 // iterSSEEvents 解析 GLM 返回的 SSE（Server-Sent Events）流
 // 返回解析后的 JSON 事件对象 channel，以及读流错误 channel。
 // scanErrCh 在流结束时发送一个值后关闭：
-//   - nil：流正常结束（EOF）
-//   - 非 nil：流读取过程中连接中断
+//   - nil：流正常结束（EOF），或调用方通过取消 ctx 主动结束（如收到 finish 事件后关闭 body）
+//   - 非 nil：流读取过程中连接意外中断（供上层触发续流）
+//
+// ctx 用于区分"主动结束"与"意外中断"：当 ctx 已被取消时，scanner 读到的
+// "use of closed network connection" 错误属于调用方主动关闭 body 所致，
+// 不再上报为 WARNING，避免正常完成的请求产生误导性告警。
 //
 // SSE 解析逻辑：
 //   - 以 "\n\n" 作为事件分隔符
 //   - 提取 "data:" 前缀后的内容作为 JSON payload
 //   - "[DONE]" 标记表示流结束（不发送到 channel）
 //   - 无法解析的 JSON 片段被静默忽略
-func (c *Client) iterSSEEvents(body io.Reader) (<-chan map[string]any, <-chan error) {
+func (c *Client) iterSSEEvents(ctx context.Context, body io.Reader) (<-chan map[string]any, <-chan error) {
 	out := make(chan map[string]any, 32)
 	scanErrCh := make(chan error, 1)
 	go func() {
@@ -1104,8 +1120,13 @@ func (c *Client) iterSSEEvents(body io.Reader) (<-chan map[string]any, <-chan er
 				emitBlock(block)
 			}
 		}
-		// 读取中断（连接断开等），上报错误供上层触发续流
+		// 读取中断：若 ctx 已取消，说明是调用方主动关闭 body（如收到 finish 后收尾），
+		// 属预期行为，不记录 WARNING，按正常结束上报 nil。
 		if err := scanner.Err(); err != nil {
+			if ctx.Err() != nil {
+				scanErrCh <- nil
+				return
+			}
 			c.logger.Warn("GLM SSE 流读取中断", "error", err)
 			scanErrCh <- err
 			return
