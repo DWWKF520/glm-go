@@ -353,6 +353,91 @@ func coerceParamValue(value any, expectedType string) any {
 	return value
 }
 
+// coerceParamValueHeuristic 在没有工具 schema 的情况下，对参数值做启发式类型矫正。
+// GLM 服务端原生工具（如 WebSearch）可能不在客户端提供的 ToolsList 中，
+// 此时无法通过 schema 矫正类型，用启发式处理字符串值：
+//   - 纯整数字符串 "5" → int64(5)
+//   - 浮点数字符串 "3.14" → float64(3.14)
+//   - "true"/"false"（不区分大小写）→ 布尔值
+//   - 其他字符串保持不变
+//
+// 避免过度转换：仅处理明确的数字和布尔字面量，不处理日期、ID 等字符串。
+func coerceParamValueHeuristic(value any) any {
+	s, ok := value.(string)
+	if !ok {
+		return value
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return value
+	}
+	// 整数：纯数字（可选负号），不含小数点
+	if isIntegerLiteral(s) {
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return i
+		}
+	}
+	// 浮点数：含小数点
+	if strings.Contains(s, ".") {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
+	}
+	// 布尔值
+	switch strings.ToLower(s) {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	return value
+}
+
+// isIntegerLiteral 判断字符串是否为纯整数字面量（可选负号开头，后跟数字）。
+// 用于启发式类型矫正，避免把 "1e5"、"0x1F"、"1_000" 等误判为整数。
+func isIntegerLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[0] == '-' || s[0] == '+' {
+		i = 1
+	}
+	if i >= len(s) {
+		return false
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// coerceToolCallArgs 对工具调用参数进行类型矫正（schema 优先 + 启发式兜底）。
+// 若工具在 schema 中有定义，按 schema 类型矫正；否则对字符串值做启发式矫正。
+// 跳过 "id" 参数（工具调用 ID 不应被转换）。
+func coerceToolCallArgs(args map[string]any, toolName string, toolParamTypes map[string]map[string]string) map[string]any {
+	if len(args) == 0 {
+		return args
+	}
+	paramTypes, hasSchema := toolParamTypes[toolName]
+	for k, v := range args {
+		if k == "id" {
+			continue
+		}
+		if hasSchema {
+			if expectedType, ok := paramTypes[k]; ok {
+				args[k] = coerceParamValue(v, expectedType)
+				continue
+			}
+		}
+		// 无 schema 或该参数未定义类型：启发式矫正
+		args[k] = coerceParamValueHeuristic(v)
+	}
+	return args
+}
+
 // SanitizeToolCallPayload 清理单个工具调用的参数
 //
 // 处理逻辑：
@@ -885,41 +970,24 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 							arguments = embeddedArgs
 							a.Logger.Debug("使用 name 中嵌入的参数作为 arguments", "toolName", toolName)
 						}
-						// 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）
+						// 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）；
+						// 无 schema 时（如 GLM 服务端原生工具）用启发式矫正
 						argsStr := "{}"
+						toolParamTypes := buildToolParamTypeMap(a.ToolsList)
 						if s, ok := arguments.(string); ok {
 							// string 类型：先解析为 map，矫正后再序列化
 							var parsed map[string]any
 							if err := sonic.UnmarshalString(s, &parsed); err == nil && parsed != nil {
-								toolParamTypes := buildToolParamTypeMap(a.ToolsList)
-								if paramTypes, exists := toolParamTypes[toolName]; exists {
-									for k, v := range parsed {
-										if expectedType, ok := paramTypes[k]; ok {
-											if k == "id" {
-												continue
-											}
-											parsed[k] = coerceParamValue(v, expectedType)
-										}
-									}
-								}
-								argsStr = tools.SafeJSONDumpsCompact(parsed)
+								argsStr = tools.SafeJSONDumpsCompact(coerceToolCallArgs(parsed, toolName, toolParamTypes))
 							} else {
 								argsStr = s
 							}
 						} else if argsMap, ok := arguments.(map[string]any); ok {
 							// map 类型：直接矫正
-							toolParamTypes := buildToolParamTypeMap(a.ToolsList)
-							if paramTypes, exists := toolParamTypes[toolName]; exists {
-								for k, v := range argsMap {
-									if expectedType, ok := paramTypes[k]; ok {
-										if k == "id" {
-											continue
-										}
-										argsMap[k] = coerceParamValue(v, expectedType)
-									}
-								}
-							}
-							argsStr = tools.SafeJSONDumpsCompact(argsMap)
+							argsStr = tools.SafeJSONDumpsCompact(coerceToolCallArgs(argsMap, toolName, toolParamTypes))
+						} else if arguments != nil {
+							// 其他类型（如数字、布尔）：直接序列化
+							argsStr = tools.SafeJSONDumpsCompact(arguments)
 						}
 
 						// 去重：同一个 toolID 只记录一次

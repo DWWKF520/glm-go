@@ -306,6 +306,8 @@ func ToolsToPrompt(tools []map[string]any, serverSideToolNames map[string]bool) 
 	parts := []string{
 		"# TOOL SCHEMAS",
 		"记住，你本身没有以下调用工具的能力，只是通过[function_calls]模拟工具调用，然后第三方解析模拟的工具调用结果返回tool_result",
+		"write工具比较脆弱，一次只能写大概200行代码，否则会崩溃，应该用SearchReplace多次写入",
+		"尽量启动子代理完成小任务",
 		"",
 		strings.Join(toolSchemas, "\n\n"),
 	}

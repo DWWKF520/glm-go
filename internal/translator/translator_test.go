@@ -611,3 +611,112 @@ func deepEqual(a, b any) bool {
 	// 其他类型直接比较
 	return a == b
 }
+
+// TestCoerceParamValueHeuristic 验证无 schema 时的启发式类型矫正
+func TestCoerceParamValueHeuristic(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+		want  any
+	}{
+		{"整数字符串", "5", int64(5)},
+		{"负整数字符串", "-3", int64(-3)},
+		{"正整数字符串(带+号)", "+10", int64(10)},
+		{"浮点字符串", "3.14", 3.14},
+		{"负浮点字符串", "-0.5", -0.5},
+		{"布尔true小写", "true", true},
+		{"布尔false小写", "false", false},
+		{"布尔TRUE大写", "TRUE", true},
+		{"布尔False大写", "False", false},
+		{"普通字符串不变", "hello", "hello"},
+		{"URL字符串不变", "https://example.com", "https://example.com"},
+		{"日期字符串不变", "2026-08-01", "2026-08-01"},
+		{"ID字符串不变", "call_123", "call_123"},
+		{"带空格的整数", "  42  ", int64(42)},
+		{"空字符串不变", "", ""},
+		{"零字符串", "0", int64(0)},
+		{"数字非字符串(int64)", int64(42), int64(42)},
+		{"数字非字符串(float64)", 3.14, 3.14},
+		{"布尔非字符串", true, true},
+		{"含字母的数字串", "5a", "5a"},
+		{"科学计数法(非纯整数)", "1e5", "1e5"},
+		{"十六进制(非纯整数)", "0x1F", "0x1F"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := coerceParamValueHeuristic(tt.value)
+			if !deepEqual(got, tt.want) {
+				t.Errorf("coerceParamValueHeuristic(%v) = %v (%T), want %v (%T)",
+					tt.value, got, got, tt.want, tt.want)
+			}
+		})
+	}
+}
+
+// TestCoerceToolCallArgs 验证 schema 优先 + 启发式兜底的参数矫正
+func TestCoerceToolCallArgs(t *testing.T) {
+	toolParamTypes := map[string]map[string]string{
+		"SearchWithSchema": {
+			"num":    "integer",
+			"query":  "string",
+			"active": "boolean",
+		},
+	}
+
+	tests := []struct {
+		name     string
+		args     map[string]any
+		toolName string
+		want     map[string]any
+	}{
+		{
+			name:     "有schema-按schema矫正",
+			args:     map[string]any{"num": "5", "query": "test", "active": "true"},
+			toolName: "SearchWithSchema",
+			want:     map[string]any{"num": int64(5), "query": "test", "active": true},
+		},
+		{
+			name:     "有schema但参数未定义类型-启发式兜底",
+			args:     map[string]any{"num": "5", "unknown": "10"},
+			toolName: "SearchWithSchema",
+			want:     map[string]any{"num": int64(5), "unknown": int64(10)},
+		},
+		{
+			name:     "无schema(日志场景WebSearch)-启发式矫正",
+			args:     map[string]any{"query": "Tesla Optimus", "num": "5"},
+			toolName: "WebSearch",
+			want:     map[string]any{"query": "Tesla Optimus", "num": int64(5)},
+		},
+		{
+			name:     "id参数被跳过",
+			args:     map[string]any{"id": "123", "num": "5"},
+			toolName: "WebSearch",
+			want:     map[string]any{"id": "123", "num": int64(5)},
+		},
+		{
+			name:     "空args",
+			args:     map[string]any{},
+			toolName: "WebSearch",
+			want:     map[string]any{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := coerceToolCallArgs(tt.args, tt.toolName, toolParamTypes)
+			if len(got) != len(tt.want) {
+				t.Fatalf("args length = %d, want %d (got=%v, want=%v)",
+					len(got), len(tt.want), got, tt.want)
+			}
+			for k, wantV := range tt.want {
+				if gotV, exists := got[k]; !exists {
+					t.Errorf("args missing key %q", k)
+				} else if !deepEqual(gotV, wantV) {
+					t.Errorf("args[%q] = %v (%T), want %v (%T)",
+						k, gotV, gotV, wantV, wantV)
+				}
+			}
+		})
+	}
+}
