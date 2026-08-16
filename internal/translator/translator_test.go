@@ -4,12 +4,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bytedance/sonic"
+
 	"glm2api/internal/tools"
 )
 
 // TestLocalFileHintConstant 验证 LocalFileHint 与 Python LOCAL_FILE_HINT 一致
 func TestLocalFileHintConstant(t *testing.T) {
-	want := "(本地文件，不在服务区上，应该用[function_calls]工具)"
+	want := "(该文件不在工作目录下，应该用[function_calls]格式去读取或者编辑)"
 	if LocalFileHint != want {
 		t.Errorf("LocalFileHint = %q, want %q", LocalFileHint, want)
 	}
@@ -451,6 +453,58 @@ func TestConsumeEventServerSideToolCallPrefersExplicitArguments(t *testing.T) {
 	}
 	if strings.Contains(args, "embedded.txt") {
 		t.Errorf("should not use embedded args when explicit arguments provided, got %q", args)
+	}
+}
+
+// TestConsumeEventServerSideToolCallTruncatedArgs 复现日志
+// glm-go_20260817_003635.log L47 的场景：上游流中断导致 arguments 字符串截断
+// （缺少结尾 }），此前会原样透传非法 JSON 并绕过类型矫正（"num": "5" 未变成 5）。
+// 修复后应自动补全 JSON 并应用启发式类型矫正。
+func TestConsumeEventServerSideToolCallTruncatedArgs(t *testing.T) {
+	acc := NewGLMEventAccumulator("model", "", nil, false, nil)
+
+	// L47 的真实数据：arguments 是截断的 JSON 字符串（缺 }），num 是字符串 "5"
+	event := map[string]any{
+		"conversation_id": "test-conv",
+		"parts": []any{
+			map[string]any{
+				"logic_id": "part1",
+				"content": []any{
+					map[string]any{
+						"type": "tool_calls",
+						"tool_calls": map[string]any{
+							"id":   "tool-1",
+							"name": "WebSearch",
+							"arguments": `{"query": "灵巧手 仿生手 机器人技术 发展趋势", "num": "5", "lr": "lang_zh"`,
+						},
+					},
+				},
+			},
+		},
+		"status": "processing",
+	}
+
+	acc.ConsumeEvent(event)
+
+	if len(acc.serverSideToolCalls) != 1 {
+		t.Fatalf("expected 1 server-side tool call, got %d", len(acc.serverSideToolCalls))
+	}
+
+	tc := acc.serverSideToolCalls[0]
+	fn, _ := tc["function"].(map[string]any)
+	args, _ := fn["arguments"].(string)
+
+	// 修复后必须是完整可解析的 JSON
+	var parsed map[string]any
+	if err := sonic.UnmarshalString(args, &parsed); err != nil {
+		t.Fatalf("repaired args should be valid JSON, got %q: %v", args, err)
+	}
+	// 启发式矫正应将字符串 "5" 转为数字 5（JSON 反序列化后为 float64）
+	if num, ok := parsed["num"].(float64); !ok || num != 5 {
+		t.Errorf("num = %v (%T), want number 5; args=%q", parsed["num"], parsed["num"], args)
+	}
+	if q, _ := parsed["query"].(string); q != "灵巧手 仿生手 机器人技术 发展趋势" {
+		t.Errorf("query = %q", q)
 	}
 }
 

@@ -131,10 +131,15 @@ func ExtractEmbeddedArgsFromName(name string, knownToolNames ...string) (actualN
 			if argsStr, _ := ExtractCallArgsBalanced(jsonPart); argsStr != "" {
 				if parsed := TryParseJSONLenient(argsStr); parsed != nil {
 					if argsMap, isMap := parsed.(map[string]any); isMap {
-						return candidate, argsMap, true
+						// json-repair 库对无值垃圾（如 "{invalid json}"）会捏造
+						// {"invalid json": ""} 结构；全空值视为无效，不提取
+						if !mapAllValuesEmpty(argsMap) {
+							return candidate, argsMap, true
+						}
+					} else {
+						// 非对象（数组、字符串等），包装为 map
+						return candidate, map[string]any{"value": parsed}, true
 					}
-					// 非对象（数组、字符串等），包装为 map
-					return candidate, map[string]any{"value": parsed}, true
 				}
 			}
 			// 对象格式提取失败，返回 candidate 作为工具名（去掉无效的 JSON 部分）
@@ -169,6 +174,18 @@ func ExtractEmbeddedArgsFromName(name string, knownToolNames ...string) (actualN
 		return toolName, map[string]any{paramName: parsed}, true
 	}
 	return toolName, map[string]any{paramName: arr}, true
+}
+
+// mapAllValuesEmpty 判断 map 中所有值是否均为空字符串。
+// json-repair 库对无可恢复内容（如 "{invalid json}"）会捏造 {"invalid json": ""} 结构，
+// 此特征用于识别捏造参数，避免从垃圾 name 中误提取嵌入参数。
+func mapAllValuesEmpty(m map[string]any) bool {
+	for _, v := range m {
+		if s, ok := v.(string); !ok || s != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // isValidToolName 判断字符串是否为合法的工具名（含字母、数字、下划线、点、冒号、连字符）。

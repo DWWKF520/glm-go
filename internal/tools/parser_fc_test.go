@@ -1,8 +1,11 @@
 package tools
 
 import (
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/bytedance/sonic"
 )
 
 func TestSplitStreamText_FunctionCalls(t *testing.T) {
@@ -124,5 +127,98 @@ func TestParseToolCallsFromText_FunctionCalls(t *testing.T) {
 	}
 	if strings.Contains(cleaned, "[function_calls]") {
 		t.Errorf("cleaned text should not contain [function_calls]: %s", cleaned)
+	}
+}
+
+// TestRepairTruncatedJSON 验证畸形 JSON 的自动修复（委托 json-repair 库）。
+// 采用值比较：库会重建 JSON（键序可能重排），字符串比较无意义。
+func TestRepairTruncatedJSON(t *testing.T) {
+	// want 为 nil 表示期望无法修复、原样返回
+	tests := []struct {
+		name  string
+		input string
+		want  any
+	}{
+		{
+			// 用户日志 glm-go_20260817_003635.log L47 的真实场景：缺少结尾 }
+			name:  "缺少结尾大括号",
+			input: `{"query": "灵巧手 仿生手 机器人技术 发展趋势", "num": "5", "lr": "lang_zh"`,
+			want:  map[string]any{"query": "灵巧手 仿生手 机器人技术 发展趋势", "num": "5", "lr": "lang_zh"},
+		},
+		{
+			name:  "字符串被截断",
+			input: `{"query": "灵巧手 仿`,
+			want:  map[string]any{"query": "灵巧手 仿"},
+		},
+		{
+			name:  "字符串末尾悬挂反斜杠",
+			input: `{"path": "e:\\test\`,
+			want:  map[string]any{"path": `e:\test`},
+		},
+		{
+			name:  "尾随逗号",
+			input: `{"a": 1,`,
+			want:  map[string]any{"a": float64(1)},
+		},
+		{
+			// 库比旧手写实现更激进：悬空键补空字符串而非删除
+			name:  "悬空键（冒号后无值）",
+			input: `{"a": 1, "b":`,
+			want:  map[string]any{"a": float64(1), "b": ""},
+		},
+		{
+			name:  "键名后截断",
+			input: `{"a": 1, "b"`,
+			want:  map[string]any{"a": float64(1), "b": ""},
+		},
+		{
+			name:  "嵌套结构截断",
+			input: `{"todos": [{"id": "1"`,
+			want:  map[string]any{"todos": []any{map[string]any{"id": "1"}}},
+		},
+		{
+			name:  "数组截断",
+			input: `{"a": [1, 2`,
+			want:  map[string]any{"a": []any{float64(1), float64(2)}},
+		},
+		{
+			// 库的额外能力：单引号 + 缺逗号
+			name:  "单引号和缺逗号",
+			input: `{'a': 'x' 'b': 'y'`,
+			want:  map[string]any{"a": "x", "b": "y"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RepairTruncatedJSON(tt.input)
+			if tt.want == nil {
+				if got != tt.input {
+					t.Errorf("RepairTruncatedJSON(%q) = %q, want 原样返回", tt.input, got)
+				}
+				return
+			}
+			var parsed any
+			if err := sonic.UnmarshalString(got, &parsed); err != nil {
+				t.Fatalf("repaired result is not valid JSON: %q: %v", got, err)
+			}
+			if !reflect.DeepEqual(parsed, tt.want) {
+				t.Errorf("RepairTruncatedJSON(%q) parsed = %#v, want %#v", tt.input, parsed, tt.want)
+			}
+		})
+	}
+
+	// 合法 JSON 原样返回（不经过库，保持调用方 repaired != original 语义）
+	t.Run("合法JSON原样返回", func(t *testing.T) {
+		input := `{"a": 1, "b": [true, null]}`
+		if got := RepairTruncatedJSON(input); got != input {
+			t.Errorf("valid JSON should be returned as-is, got %q", got)
+		}
+	})
+
+	// 空输入 / 纯文本（无可恢复内容）原样返回
+	for _, input := range []string{"", "   ", "Sure, here is the result:"} {
+		if got := RepairTruncatedJSON(input); got != input {
+			t.Errorf("RepairTruncatedJSON(%q) = %q, want 原样返回", input, got)
+		}
 	}
 }

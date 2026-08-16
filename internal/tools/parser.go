@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	jsonrepair "github.com/RealAlexandreAI/json-repair"
 	"github.com/bytedance/sonic"
 
 	"github.com/google/uuid"
@@ -129,9 +130,14 @@ func ExtractCallsFromPayload(payload any, startIndex int) []map[string]any {
 	return toolCalls
 }
 
-// TryParseJSON 尝试将文本解析为 JSON 对象。
-// 首先尝试直接解析，如果失败则尝试修复尾随逗号（LLM 输出常见问题）后再次解析。
-// 解析成功返回任意类型的 JSON 值，失败返回 nil。
+// TryParseJSON 尝试将文本解析为 JSON 值。
+// 解析层级（层层兜底）：
+//  1. sonic 直接解析（热路径，合法 JSON 零额外开销）
+//  2. 委托 json-repair 库修复 LLM 输出的常见问题：
+//     截断（缺闭合括号/引号）、尾随逗号、单引号、缺引号键、缺逗号、
+//     Python 字面量（True/False/None）、markdown 围栏、前后夹杂多余文本等
+//
+// 库对纯文本/空输入返回 ""（无可恢复内容），此时返回 nil 以保持调用方的 nil 语义。
 func TryParseJSON(text string) any {
 	stripped := strings.TrimSpace(text)
 	if stripped == "" {
@@ -141,8 +147,17 @@ func TryParseJSON(text string) any {
 	if err := sonic.UnmarshalString(stripped, &v); err == nil {
 		return v
 	}
-	// 修复尾随逗号
-	repaired := trailingCommaRE.ReplaceAllString(stripped, "$1")
+	return parseRepairedJSON(stripped)
+}
+
+// parseRepairedJSON 用 json-repair 库修复文本并解析。
+// 修复失败或无可恢复内容（返回 ""）时返回 nil。
+func parseRepairedJSON(text string) any {
+	repaired, err := jsonrepair.RepairJSON(text)
+	if err != nil || repaired == `""` {
+		return nil
+	}
+	var v any
 	if err := sonic.UnmarshalString(repaired, &v); err == nil {
 		return v
 	}
@@ -150,9 +165,8 @@ func TryParseJSON(text string) any {
 }
 
 // TryParseJSONLenient 是 TryParseJSON 的宽松版本，自动尝试修复常见 JSON 错误。
-// 相比 TryParseJSON，它额外处理：
+// 相比 TryParseJSON，它额外兜底：
 //   - 提取文本中第一个平衡的 JSON 对象（忽略前后多余字符）
-//   - 修复尾随逗号等常见格式问题
 //
 // 用于处理 LLM 输出中夹杂多余文本的 JSON（如 `prefix {"a":1} extra`）。
 // 解析成功返回任意类型的 JSON 值，失败返回 nil。
@@ -160,21 +174,13 @@ func TryParseJSONLenient(text string) any {
 	if v := TryParseJSON(text); v != nil {
 		return v
 	}
-	// 尝试提取第一个平衡的 JSON 对象（忽略前后多余字符）
+	// 兜底：提取第一个平衡的 JSON 对象（忽略前后多余字符）
 	objText, _ := ExtractFirstJSONObject(text, 0)
 	if objText == "" {
 		return nil
 	}
-	if v := TryParseJSON(objText); v != nil {
-		return v
-	}
-	// 最后尝试修复后解析
-	fixed := FixCommonJsonErrors(objText)
-	return TryParseJSON(fixed)
+	return TryParseJSON(objText)
 }
-
-// trailingCommaRE 匹配 JSON 中 } 或 ] 前的尾随逗号，用于 FixCommonJsonErrors 修复 LLM 输出
-var trailingCommaRE = regexp.MustCompile(`,\s*([\]}])`)
 
 // ExtractFirstJSONObject 从 text 的 start 位置开始，提取第一个花括号平衡的 {...} JSON 对象。
 // 使用深度计数器跟踪大括号嵌套，正确处理字符串内的转义字符和引号。
@@ -270,16 +276,27 @@ func ExtractFirstJSONArray(text string, start int) (string, [2]int) {
 	return "", [2]int{-1, -1}
 }
 
-// FixCommonJsonErrors 修复 LLM 输出中常见的 JSON 格式错误。
-// 目前主要修复：移除 } 或 ] 前的尾随逗号（例如 {"a":1,} → {"a":1}）。
-// 如果输入为空，直接返回原值。
-func FixCommonJsonErrors(text string) string {
-	if text == "" {
+// RepairTruncatedJSON 修复因流式中断等原因产生的畸形 JSON 文本（如缺少结尾 }）。
+// 委托 json-repair 库完成修复（截断补全、尾随逗号、悬空键补空值、单引号等）。
+// 输入已是合法 JSON 或无法修复时返回原文本，保证调用方无副作用
+// （调用方通过 repaired != original 判断是否发生修复）。
+func RepairTruncatedJSON(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
 		return text
 	}
-	// 移除 } 或 ] 前的尾随逗号
-	fixed := trailingCommaRE.ReplaceAllString(text, "$1")
-	return fixed
+	var probe any
+	if err := sonic.UnmarshalString(trimmed, &probe); err == nil {
+		return text // 已是合法 JSON，无需修复
+	}
+	repaired, err := jsonrepair.RepairJSON(trimmed)
+	if err != nil || repaired == `""` {
+		return text
+	}
+	if err := sonic.UnmarshalString(repaired, &probe); err != nil {
+		return text
+	}
+	return repaired
 }
 
 // RemoveSpans 从文本中移除指定的字符范围，并清理结果中的多余空行和工具结果块。
@@ -371,10 +388,6 @@ func ExtractFencedBlocks(text string) ([][2]int, []map[string]any) {
 			}
 
 			argsDict := TryParseJSON(argsStr)
-			if argsDict == nil {
-				fixedArgs := FixCommonJsonErrors(argsStr)
-				argsDict = TryParseJSON(fixedArgs)
-			}
 			if argsDict == nil {
 				argsDict = map[string]any{}
 			}
@@ -835,10 +848,6 @@ func extractFunctionCallsFromText(text string, startIndex int) []map[string]any 
 		}
 
 		argsDict := TryParseJSON(argsStr)
-		if argsDict == nil {
-			fixedArgs := FixCommonJsonErrors(argsStr)
-			argsDict = TryParseJSON(fixedArgs)
-		}
 		if argsDict == nil {
 			argsDict = map[string]any{}
 		}

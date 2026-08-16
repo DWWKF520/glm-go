@@ -762,8 +762,6 @@ func ConvertMessages(
 	for _, item := range processed {
 		title := item.role
 		switch title {
-		case "system":
-			title = "System"
 		case "assistant":
 			title = "Assistant"
 		case "user":
@@ -977,7 +975,18 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						if s, ok := arguments.(string); ok {
 							// string 类型：先解析为 map，矫正后再序列化
 							var parsed map[string]any
-							if err := sonic.UnmarshalString(s, &parsed); err == nil && parsed != nil {
+							if err := sonic.UnmarshalString(s, &parsed); err != nil || parsed == nil {
+								// JSON 被截断（上游流中断导致缺少闭合括号等）：尝试补全后重新解析，
+								// 否则原样透传会绕过类型矫正，且非法 JSON 下发给客户端也无法解析
+								parsed = nil
+								if repaired := tools.RepairTruncatedJSON(s); repaired != s {
+									if err := sonic.UnmarshalString(repaired, &parsed); err == nil && parsed != nil {
+										a.Logger.Warn("服务端工具调用 arguments 被截断，已自动补全修复",
+											"toolName", toolName, "raw", s, "repaired", repaired)
+									}
+								}
+							}
+							if parsed != nil {
 								argsStr = tools.SafeJSONDumpsCompact(coerceToolCallArgs(parsed, toolName, toolParamTypes))
 							} else {
 								argsStr = s
