@@ -6,7 +6,7 @@ package translator
 //   1. 将 OpenAI 格式的 chat messages 转换为 GLM Web API 能理解的文本提示词（ConvertMessages）
 //   2. 将 GLM 返回的 SSE 流事件累积并转换为 OpenAI 格式的 SSE chunks（GLMEventAccumulator）
 //   3. 清理和修复 GLM 模型输出的工具调用（SanitizeToolCalls）
-//   4. 处理本地文件路径提示、图片引用等辅助功能
+//   4. 处理图片引用等辅助功能
 //
 // 数据流向：
 //   入站（OpenAI → GLM）：
@@ -42,74 +42,12 @@ var (
 	urlPattern = regexp.MustCompile(`https?://[^\s<>()"']+`)
 )
 
-// LocalFileHint 追加在本地文件路径后的提示文本，告知 GLM 该文件在本地不在服务端
-const LocalFileHint = "(该文件不在工作目录下，应该用[function_calls]格式去读取或者编辑)"
-
 var (
 	// systemReminderRE 匹配 <system-reminder> 标签及其后所有内容
 	systemReminderRE = regexp.MustCompile(`(?s)<system-reminder>.*`)
-	// localFilePathRE 匹配 Windows 本地文件路径（如 C:\path\to\file.txt 或 C:/path/to/file.txt）
-	// 可选支持行号标记（如 #L10 或 #L10-20）
-	localFilePathRE = regexp.MustCompile(`[A-Za-z]:[\\\/](?:[^\s<>()"'\n\\\/]+[\\\/])*[^\s<>()"'\n\\\/]+(?:#L\d+(?:-\d+)?)?`)
 	// ImageRefRE 匹配 [image:url] 格式的图片引用标记
 	ImageRefRE = regexp.MustCompile(`\[image:[^\]]+\]`)
 )
-
-// removeLocalFileHint 递归移除值中的本地文件提示文本
-// 支持 string、map[string]any、[]any 三种类型的递归处理
-// 对字符串类型同时执行 TrimSpace 去除首尾空白
-func removeLocalFileHint(v any) any {
-	switch x := v.(type) {
-	case string:
-		return strings.TrimSpace(strings.ReplaceAll(x, LocalFileHint, ""))
-	case map[string]any:
-		result := make(map[string]any, len(x))
-		for k, val := range x {
-			result[k] = removeLocalFileHint(val)
-		}
-		return result
-	case []any:
-		result := make([]any, len(x))
-		for i, val := range x {
-			result[i] = removeLocalFileHint(val)
-		}
-		return result
-	default:
-		return v
-	}
-}
-
-// appendLocalFileHints 在文本中每个本地文件路径后追加 LocalFileHint 提示
-// 模拟 Python 的 (?<!LOCAL_FILE_HINT) 负向后顾断言：若路径已紧随提示则不重复追加
-//
-// 处理流程：
-//  1. 用 localFilePathRE 找到所有本地文件路径
-//  2. 对每个路径检查其前方是否已有提示文本
-//  3. 若无提示则追加，若有则跳过
-func appendLocalFileHints(prompt string) string {
-	matches := localFilePathRE.FindAllStringIndex(prompt, -1)
-	if len(matches) == 0 {
-		return prompt
-	}
-	hintLen := len(LocalFileHint)
-	var b strings.Builder
-	lastEnd := 0
-	for _, loc := range matches {
-		start, end := loc[0], loc[1]
-		b.WriteString(prompt[lastEnd:start])
-		match := prompt[start:end]
-		if start >= hintLen && prompt[start-hintLen:start] == LocalFileHint {
-			// 路径前已是提示，跳过避免重复
-			b.WriteString(match)
-		} else {
-			b.WriteString(match)
-			b.WriteString(LocalFileHint)
-		}
-		lastEnd = end
-	}
-	b.WriteString(prompt[lastEnd:])
-	return b.String()
-}
 
 // ExtractTextContent 从 OpenAI 消息的 content 字段中提取纯文本
 //
@@ -513,10 +451,9 @@ func SanitizeToolCallPayload(toolName string, arguments any, fallbackURL string,
 // 对每个工具调用：
 //  1. 提取并验证工具名称（空名称的调用被跳过）
 //  2. 调用 SanitizeToolCallPayload 清理参数
-//  3. 移除参数中的本地文件提示（removeLocalFileHint）
-//  4. 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）
-//  5. 检测参数是否被修复（_repaired 标记）
-//  6. 生成标准格式的工具调用对象
+//  3. 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）
+//  4. 检测参数是否被修复（_repaired 标记）
+//  5. 生成标准格式的工具调用对象
 //
 // 参数：
 //   - toolCalls: 原始工具调用列表
@@ -554,7 +491,6 @@ func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string, toolsList
 		if cleanedArguments == nil {
 			continue
 		}
-		cleanedArguments = removeLocalFileHint(cleanedArguments).(map[string]any)
 
 		// 比较清理前后的 JSON 表示，判断参数是否被修复
 		repaired := true
@@ -592,8 +528,7 @@ func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string, toolsList
 //     - assistant 消息：将 tool_calls 转换为 [function_calls] 格式
 //     - tool 消息：转换为 ```tool_result``` 格式
 //  3. 拼接工具定义 + 对话历史为完整提示词
-//  4. 在本地文件路径后追加提示
-//  5. 包装为 GLM 格式的单条 user 消息
+//  4. 包装为 GLM 格式的单条 user 消息
 //
 // 参数：
 //   - messages: OpenAI 格式的消息列表
@@ -774,9 +709,6 @@ func ConvertMessages(
 	}
 
 	prompt := strings.TrimSpace(strings.Join(transcriptParts, "\n"))
-
-	// 在本地文件路径后追加提示（跳过已带提示的路径，与 Python 负向后顾断言一致）
-	prompt = appendLocalFileHints(prompt)
 
 	// 包装为 GLM 格式的单条 user 消息，末尾追加 "Assistant:" 引导模型生成
 	return []map[string]any{
