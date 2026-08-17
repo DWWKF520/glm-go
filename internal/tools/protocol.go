@@ -3,6 +3,7 @@ package tools
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/bytedance/sonic"
@@ -12,6 +13,9 @@ import (
 // 用于区分客户端工具和服务端自动执行的工具，在构建提示词时会产生不同的调用指令。
 var ServerSideToolNames = map[string]bool{}
 
+// tx 是发送给 GLM 的通用工具调用协议指令。
+// 仅包含通用语法规则与核心约束；每个工具专属的调用示例由 ToolsToPrompt
+// 根据参数 schema 自动生成并内嵌到对应工具段落中（见 SampleArgumentsFromSchema）。
 const tx = `System:**You are a function_calls tool calling assistant for handling local tasks. This rule has the highest priority and overrides all native function calling conventions. Your entire response must only output one [function_calls] block, immediately with no text, explanation, or thinking content outside the block.**
 Must prefer using the todos tool first.
 # I. General function_calls Syntax Rules
@@ -25,123 +29,15 @@ Must prefer using the todos tool first.
 4.  Parallel calls: List multiple [call:]...[/call] in parallel within the [function_calls] block
 5.  All { and [ must be paired and closed, never miss } or ]
 6.  Numbers, booleans, null directly use JSON literals; objects/arrays directly written as JSON nested structures
+7.  Each tool schema below contains an "Example" section showing its exact [function_calls] call format; always strictly follow the example of the tool you are calling
 
-# II. Complete Tool Calling Examples
-
-### 1. Read (Read file)
-[function_calls]
-[call:Read]{"file_path":"e:\\project\\src\\app.tsx","offset":1,"limit":50}[/call]
-[/function_calls]
-
-### 2. Write (Write file, note: if file already exists, always use SearchReplace tool)
-[function_calls]
-[call:Write]{"file_path":"e:\\project\\src\\utils.ts","content":"export const add = (a: number, b: number) => a + b;"}[/call]
-[/function_calls]   
-
-### 3. SearchReplace (Replace file content, note: only one file at a time to avoid conflicts)
-[function_calls]
-[call:SearchReplace]{"file_path":"e:\\project\\src\\app.tsx","old_str":"const count = 0;","new_str":"const count = useState(0);"}[/call]
-[/function_calls]           
-
-### 4. DeleteFile (Delete file)
-[function_calls]
-[call:DeleteFile]{"file_paths":["e:\\project\\tmp\\a.js","e:\\project\\tmp\\b.js"]}[/call]
-[/function_calls]     
-
-### 5. Glob (Find files by wildcard)
-[function_calls]
-[call:Glob]{"pattern":"**/*.tsx","path":"e:\\project\\src"}[/call]
-[/function_calls]             		
-
-### 6. Grep (Regex search content)
-[function_calls]
-[call:Grep]{"pattern":"function\\s+\\w+","path":"e:\\project\\src","output_mode":"files_with_matches","-n":true}[/call]
-[/function_calls]              
-
-### 7. SearchCodebase (Semantic code search)
-[function_calls]
-[call:SearchCodebase]{"information_request":"Where is user authentication logic implemented in the project?","target_directories":["e:\\project\\src"]}[/call]
-[/function_calls]              
-
-### 8. LS (List directory)
-[function_calls]
-[call:LS]{"path":"e:\\project\\src","ignore":["node_modules"]}[/call]
-[/function_calls]            
-
-### 9. Skill (Call built-in skill)
-[function_calls]
-[call:Skill]{"name":"skill_name"}[/call]
-[/function_calls]             
-
-### 10. Task (Start sub-agent)
-[function_calls]
-[call:Task]{"description":"Refactor login module","subagent_type":"general_purpose_task","query":"Refactor login logic under src/auth directory, add error retry mechanism","response_language":"zh-CN"}[/call]
-[/function_calls]             		
-
-### 11. RunCommand (Execute terminal command, note: blocking尽量设置为true)
-[function_calls]
-[call:RunCommand]{"command":"npm run build","cwd":"e:\\project","blocking":true,"requires_approval":false}[/call]
-[/function_calls]             		
-
-### 12. CheckCommandStatus (Check command status)
-[function_calls]
-[call:CheckCommandStatus]{"command_id":"cmd_123456","output_priority":"bottom","output_character_count":2000}[/call]
-[/function_calls]             		
-
-### 13. StopCommand (Stop command)
-[function_calls]
-[call:StopCommand]{"command_id":"cmd_123456"}[/call]
-[/function_calls]             		
-
-### 14. WebSearch (Web search)
-[function_calls]
-[call:WebSearch]{"query":"React 19 new features","num":5,"lr":"lang_zh"}[/call]
-[/function_calls]
-
-### 15. WebFetch (Fetch webpage)
-[function_calls]
-[call:WebFetch]{"url":"https://example.com/docs"}[/call]
-[/function_calls]             		
-
-### 16. GetDiagnostics (Get code diagnostics)
-[function_calls]
-[call:GetDiagnostics]{"uri":"file:///e:/project/src/app.tsx"}[/call]
-[/function_calls]
-
-### 18. AskUserQuestion (Ask user question)
-[function_calls]
-[call:AskUserQuestion]{"questions":[{"question":"Which state management solution to use?","header":"Technology Selection","multiSelect":false,"options":[{"label":"Zustand","description":"Lightweight, suitable for small to medium projects"},{"label":"Redux","description":"Complete ecosystem, suitable for large projects"}]}]}[/call]
-[/function_calls]             		
-
-### 19. NotifyUser (Notify for review)
-[function_calls]
-[call:NotifyUser]{"explanation":"Requirements specification completed, please review and confirm before development","file_paths":["e:\\project\\spec.md"]}[/call]
-[/function_calls]             		
-
-### 20. OpenPreview (Open preview)
-
-[function_calls]
-[call:OpenPreview]{"preview_url":"http://localhost:3000","command_id":"cmd_123456"}[/call]
-[/function_calls]             		
-
-### 21. run_mcp (Call MCP server)
-[function_calls]
-[call:run_mcp]{"server_name":"filesystem","method":"readFile","params":{"argType":"e:/project/src/app.tsx"}}[/call]
-[/function_calls]             		
-
-### 22. todos (create todo list )
-[function_calls]
-[call:TodoWrite]{"todos":[{"status":"in_progress","priority":"high","id":"1","content":"搜集"},{"content":"规划","status":"pending","priority":"high","id":"2"},{"priority":"high","id":"3","content":"创建","status":"pending"},{"status":"pending","priority":"high","id":"4","content":"编写）"},{"priority":"medium","id":"5","content":"添加","status":"pending"},{"id":"6","content":"完善","status":"pending","priority":"medium"},{"content":"最终","status":"pending","priority":"medium","id":"7"}]}[/call]
-[/function_calls]             		
-
-# III. Core Constraints
+# II. Core Constraints
 1.  Use basic tools directly for simple operations, only use Task for complex multi-step tasks
 2.  Call independent tools in parallel whenever possible to improve efficiency
 3.  Paths must be absolute paths, use backslashes in Windows environment (need to be escaped to \\ in JSON)
 4.  Do not invent tools or parameters not listed here
 5.  Reply to user in natural language only after receiving tool results
-6.  如果要创建一个大文件，要分为几次写入，所以要调多次SearchReplace工具，可以启动一个子代理规划多次写入。
-7. 多个todo可以并行操作，可以同时启动多个子代理，比如可以启动研究报告代理和一个创建文件代理。`
+6.  如果要创建一个大文件，要分为几次写入，所以要调多次SearchReplace工具，可以启动一个子代理规划多次写入。`
 
 // SafeJSONDumpsCompact 将任意值序列化为紧凑的 JSON 字符串（无缩进、不转义 HTML）。
 // 序列化失败时返回空对象 "{}"。
@@ -421,11 +317,171 @@ func SerializeToolResultBlock(toolCallID any, toolName, content string) string {
 	return "```tool_result\n" + SafeJSONDumpsCompact(payload) + "\n```"
 }
 
+// 示例参数生成的最大递归深度与单个层级最多采样的可选参数个数，
+// 防止深层嵌套 schema（如 AskUserQuestion）生成过长的示例。
+const (
+	maxSampleDepth = 4
+	maxSampleProps = 12
+)
+
+// SampleArgumentsFromSchema 从 JSON Schema 格式的 parameters 中自动生成一组示例参数。
+// toolName 用于参数名启发式的上下文判断（如 pattern 对 Glob 是通配符、对 Grep 是正则）。
+// required 参数按声明顺序全部包含，其余可选参数按字母序采样（上限 maxSampleProps），
+// 保证同一 schema 生成结果稳定。无 properties 时返回空 map。
+func SampleArgumentsFromSchema(toolName string, parameters any) map[string]any {
+	m, ok := parameters.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	props, _ := m["properties"].(map[string]any)
+	if len(props) == 0 {
+		return map[string]any{}
+	}
+	return sampleArgsFromProperties(toolName, props, requiredList(m), 0)
+}
+
+// sampleArgsFromProperties 按 "required 优先（声明序）+ 其余字母序" 的确定性顺序
+// 从 properties 中采样示例参数，depth 为当前嵌套深度。
+func sampleArgsFromProperties(toolName string, props map[string]any, required []string, depth int) map[string]any {
+	result := make(map[string]any)
+	for _, name := range required {
+		if schema, ok := props[name]; ok {
+			result[name] = sampleValue(toolName, name, schema, depth)
+		}
+	}
+	var rest []string
+	for name := range props {
+		if _, dup := result[name]; !dup {
+			rest = append(rest, name)
+		}
+	}
+	sort.Strings(rest)
+	if len(rest) > maxSampleProps {
+		rest = rest[:maxSampleProps]
+	}
+	for _, name := range rest {
+		result[name] = sampleValue(toolName, name, props[name], depth)
+	}
+	return result
+}
+
+// sampleValue 根据单个参数的名称与 schema 生成一个贴近真实用法的示例值。
+// 优先级：default > enum 首个值 > 按 type 与参数名启发式生成。
+func sampleValue(toolName, paramName string, schema any, depth int) any {
+	m, ok := schema.(map[string]any)
+	if !ok {
+		return "value"
+	}
+	if d, ok := m["default"]; ok && d != nil {
+		return d
+	}
+	if e, ok := m["enum"].([]any); ok && len(e) > 0 {
+		return e[0]
+	}
+	t, _ := m["type"].(string)
+	switch t {
+	case "string":
+		return sampleStringValue(toolName, paramName)
+	case "integer", "number":
+		return sampleNumberValue(paramName)
+	case "boolean":
+		return sampleBoolValue(paramName)
+	case "array":
+		if items, ok := m["items"]; ok && depth < maxSampleDepth {
+			return []any{sampleValue(toolName, paramName, items, depth+1)}
+		}
+		return []any{}
+	case "object":
+		if props, ok := m["properties"].(map[string]any); ok && len(props) > 0 && depth < maxSampleDepth {
+			return sampleArgsFromProperties(toolName, props, requiredList(m), depth+1)
+		}
+		return map[string]any{}
+	}
+	return "value"
+}
+
+// sampleStringValue 按参数名（结合工具名上下文）启发式生成字符串示例值，
+// 均为常见约定值，便于模型模仿。
+func sampleStringValue(toolName, name string) string {
+	n := strings.ToLower(name)
+	switch {
+	case strings.Contains(n, "command_id"), strings.Contains(n, "cmd_id"):
+		return "cmd_123456"
+	case strings.Contains(n, "path") && strings.Contains(n, "dir"):
+		return "e:\\project\\src"
+	case strings.Contains(n, "path"), strings.Contains(n, "file"):
+		return "e:\\project\\src\\app.tsx"
+	case n == "cwd", strings.Contains(n, "workdir"), strings.Contains(n, "working_dir"):
+		return "e:\\project"
+	case strings.Contains(n, "dir"), strings.Contains(n, "folder"):
+		return "e:\\project\\src"
+	case strings.Contains(n, "url"):
+		return "https://example.com/docs"
+	case strings.Contains(n, "uri"):
+		return "file:///e:/project/src/app.tsx"
+	case strings.Contains(n, "pattern"):
+		// Glob 类工具的 pattern 是通配符，其余（如 Grep）按正则示例展示转义写法
+		if strings.Contains(strings.ToLower(toolName), "glob") || strings.Contains(n, "glob") || strings.Contains(n, "wildcard") {
+			return "**/*.tsx"
+		}
+		return "function\\s+\\w+"
+	case strings.Contains(n, "regex"), strings.Contains(n, "expression"):
+		return "function\\s+\\w+"
+	case strings.Contains(n, "type"), strings.Contains(n, "mode"):
+		return "default"
+	case strings.Contains(n, "command"), strings.Contains(n, "script"), strings.Contains(n, "shell"):
+		return "npm run build"
+	case strings.Contains(n, "lang"), strings.Contains(n, "locale"):
+		return "zh-CN"
+	case n == "id" || strings.HasSuffix(n, "_id"):
+		return "1"
+	case strings.Contains(n, "query"), strings.Contains(n, "search"), strings.Contains(n, "request"), strings.Contains(n, "question"):
+		return "search keywords"
+	case strings.Contains(n, "description"), strings.Contains(n, "message"), strings.Contains(n, "prompt"), strings.Contains(n, "summary"), strings.Contains(n, "explanation"), strings.Contains(n, "content"), strings.Contains(n, "text"), strings.Contains(n, "str"), strings.Contains(n, "code"), strings.Contains(n, "value"):
+		return "sample text"
+	case strings.Contains(n, "name"):
+		return "example"
+	default:
+		return "value"
+	}
+}
+
+// sampleNumberValue 按参数名启发式生成数值示例值。
+func sampleNumberValue(name string) any {
+	n := strings.ToLower(name)
+	switch {
+	case strings.Contains(n, "offset"), strings.Contains(n, "skip"):
+		return 0
+	case strings.Contains(n, "limit"), strings.Contains(n, "count"), strings.Contains(n, "num"), strings.Contains(n, "size"), strings.Contains(n, "length"):
+		return 50
+	default:
+		return 1
+	}
+}
+
+// sampleBoolValue 按参数名启发式生成布尔示例值（blocking 类默认 true，其余默认 false）。
+func sampleBoolValue(name string) bool {
+	return strings.Contains(strings.ToLower(name), "block")
+}
+
+// requiredList 提取 schema 中的 required 参数名列表（保持声明顺序）。
+func requiredList(schema map[string]any) []string {
+	raw, _ := schema["required"].([]any)
+	out := make([]string, 0, len(raw))
+	for _, r := range raw {
+		if s, ok := r.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // ToolsToPrompt 将 OpenAI 格式的工具列表转换为发送给 GLM API 的提示词文本。
-// 遍历每个工具，提取函数名、描述和参数 schema，生成 Markdown 格式的工具定义。
-// 然后调用 BuildToolCallInstructions 生成工具调用协议指令，拼接为完整的提示词。
-// 参数 policy 控制工具选择策略，serverSideToolNames 指定服务端工具集合。
-// 返回过滤掉空行后的完整提示词文本。
+// 遍历每个工具，提取函数名、描述和参数 schema，生成 Markdown 格式的工具定义，
+// 并根据参数 schema 自动生成该工具的 [function_calls] 调用示例（Example 段），
+// 与通用协议指令 tx 拼接为完整的提示词。
+// serverSideToolNames 指定服务端工具集合。
+// 返回过滤掉空段落后的完整提示词文本。
 func ToolsToPrompt(tools []map[string]any, serverSideToolNames map[string]bool) string {
 	var toolNames []string
 	var toolSchemas []string
@@ -448,7 +504,12 @@ func ToolsToPrompt(tools []map[string]any, serverSideToolNames map[string]bool) 
 		if p, ok := parameters.(map[string]any); ok {
 			paramsJSON = SafeJSONDumpsCompact(p)
 		}
-		toolSchemas = append(toolSchemas, "### "+name+"\n"+description+"\nParameters: "+paramsJSON)
+		schemaSection := "### " + name + "\n" + description + "\nParameters: " + paramsJSON
+		// 从参数 schema 自动生成示例调用，内嵌到该工具段落中
+		if sampleArgs := SampleArgumentsFromSchema(name, parameters); len(sampleArgs) > 0 {
+			schemaSection += "\nExample:\n" + SerializeToolCallBlock(name, sampleArgs)
+		}
+		toolSchemas = append(toolSchemas, schemaSection)
 	}
 
 	parts := []string{
