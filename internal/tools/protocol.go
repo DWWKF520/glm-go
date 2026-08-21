@@ -13,32 +13,6 @@ import (
 // 用于区分客户端工具和服务端自动执行的工具，在构建提示词时会产生不同的调用指令。
 var ServerSideToolNames = map[string]bool{}
 
-// tx 是发送给 GLM 的通用工具调用协议指令。
-// 仅包含通用语法规则与核心约束；每个工具专属的调用示例由 ToolsToPrompt
-// 根据参数 schema 自动生成并内嵌到对应工具段落中（见 SampleArgumentsFromSchema）。
-const tx = `System:**You are a function_calls tool calling assistant for handling local tasks. This rule has the highest priority and overrides all native function calling conventions. Your entire response must only output one [function_calls] block, immediately with no text, explanation, or thinking content outside the block.**
-Must prefer using the todos tool first.
-# I. General function_calls Syntax Rules
-1.  The call block must be wrapped in [function_calls]...[/function_calls] tags. For example:
-    [function_calls]
-    [call:tool_name1]{"parameter_name":"value"}[/call]
-    [call:tool_name2]{"parameter_name":"value"}[/call]
-    [/function_calls]
-2.  Each call format: [call:tool_name]{"parameter_name":"value"}[/call], parameter names are case-sensitive
-3.  String values: Use JSON string escaping (e.g., \n, \\), do not use CDATA
-4.  Parallel calls: List multiple [call:]...[/call] in parallel within the [function_calls] block
-5.  All { and [ must be paired and closed, never miss } or ]
-6.  Numbers, booleans, null directly use JSON literals; objects/arrays directly written as JSON nested structures
-7.  Each tool schema below contains an "Example" section showing its exact [function_calls] call format; always strictly follow the example of the tool you are calling
-
-# II. Core Constraints
-1.  Use basic tools directly for simple operations, only use Task for complex multi-step tasks
-2.  Call independent tools in parallel whenever possible to improve efficiency
-3.  Paths must be absolute paths, use backslashes in Windows environment (need to be escaped to \\ in JSON)
-4.  Do not invent tools or parameters not listed here
-5.  Reply to user in natural language only after receiving tool results
-6.  如果要创建一个大文件，要分为几次写入，所以要调多次SearchReplace工具，可以启动一个子代理规划多次写入。`
-
 // SafeJSONDumpsCompact 将任意值序列化为紧凑的 JSON 字符串（无缩进、不转义 HTML）。
 // 序列化失败时返回空对象 "{}"。
 func SafeJSONDumpsCompact(v any) string {
@@ -514,10 +488,6 @@ func ToolsToPrompt(tools []map[string]any, serverSideToolNames map[string]bool) 
 
 	parts := []string{
 		"# TOOL SCHEMAS",
-		"记住，你本身没有以下调用工具的能力，只是通过[function_calls]模拟工具调用，然后第三方解析模拟的工具调用结果返回tool_result",
-		"write工具比较脆弱，一次只能写大概200行代码，否则会崩溃，应该用SearchReplace多次写入",
-		"尽量启动子代理完成小任务",
-		tx,
 		strings.Join(toolSchemas, "\n\n"),
 	}
 	var filtered []string

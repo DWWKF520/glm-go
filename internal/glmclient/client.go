@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -286,9 +287,15 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 	out := make(chan []byte, 32)
 	go func() {
 		defer close(out)
+		usedContinueStream := false
 		defer func() {
 			response.Body.Close()
-			c.DeleteConversation(context.Background(), accumulator.ConversationID, assistantID)
+			if !usedContinueStream {
+				c.DeleteConversation(context.Background(), accumulator.ConversationID, assistantID)
+			} else {
+				c.logger.Info("GLM 会话经过 continue_stream 续流，跳过删除会话",
+					"conversation_id", accumulator.ConversationID)
+			}
 			lease.Release()
 		}()
 
@@ -317,6 +324,7 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 				c.logger.Warn("GLM 续流请求失败", "error", err, "history_id", historyID)
 				break
 			}
+			usedContinueStream = true
 			currentResp = contResp
 		}
 		for _, chunk := range accumulator.Finalize("stop", nil) {
@@ -526,6 +534,16 @@ func (c *Client) DeleteConversation(ctx context.Context, conversationID, assista
 	if !c.config.GLMDeleteConversation {
 		return
 	}
+	// 随机触发删除：以配置概率决定是否执行，避免频繁删除会话
+	probability := c.config.GLMDeleteConversationProbability
+	if probability >= 1 {
+		// 概率为 1 时总是删除
+	} else if probability <= 0 {
+		return
+	} else if rand.Float64() >= probability {
+		c.logger.Info("随机跳过删除 GLM 会话", "conversation_id", conversationID)
+		return
+	}
 	if conversationID == "" {
 		c.logger.Warn("跳过删除 GLM 会话：未获取到 conversation_id", "assistant_id", assistantID)
 		return
@@ -650,10 +668,11 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 		"messages":        convertedMessages,
 		"meta_data": map[string]any{
 			"channel":             "",
-			"chat_mode":           "deep_thinking", // 启用思考模式
+			"chat_mode":           "thinking", // 启用思考模式
 			"draft_id":            "",
 			"if_plus_model":       true,
 			"input_question_type": "xxxx",
+			"selected_model":      "5.3",
 			"is_networking":       false,
 			"is_test":             false,
 			"platform":            "pc",

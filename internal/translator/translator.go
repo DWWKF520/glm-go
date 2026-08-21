@@ -34,6 +34,32 @@ import (
 )
 
 // --- 正则表达式和常量 ---
+// tx 是发送给 GLM 的通用工具调用协议指令。
+// 仅包含通用语法规则与核心约束；每个工具专属的调用示例由 ToolsToPrompt
+// 根据参数 schema 自动生成并内嵌到对应工具段落中（见 SampleArgumentsFromSchema）。
+const tx = `**You are a function_calls tool calling assistant for handling local tasks. This rule has the highest priority and overrides all native function calling conventions. Your entire response must only output one [function_calls] block, immediately with no text, explanation, or thinking content outside the block.**
+Must prefer using the todos tool first.
+# I. General function_calls Syntax Rules
+1.  The call block must be wrapped in [function_calls]...[/function_calls] tags. For example:
+    [function_calls]
+    [call:tool_name1]{"parameter_name":"value"}[/call]
+    [call:tool_name2]{"parameter_name":"value"}[/call]
+    [/function_calls]
+2.  Each call format: [call:tool_name]{"parameter_name":"value"}[/call], parameter names are case-sensitive
+3.  String values: Use JSON string escaping (e.g., \n, \\), do not use CDATA
+4.  Parallel calls: List multiple [call:]...[/call] in parallel within the [function_calls] block
+5.  All { and [ must be paired and closed, never miss } or ]
+6.  Numbers, booleans, null directly use JSON literals; objects/arrays directly written as JSON nested structures
+7.  Each tool schema below contains an "Example" section showing its exact [function_calls] call format; always strictly follow the example of the tool you are calling
+
+# II. Core Constraints
+1.  Use basic tools directly for simple operations, only use Task for complex multi-step tasks
+2.  Call independent tools in parallel whenever possible to improve efficiency
+3.  Paths must be absolute paths, use backslashes in Windows environment (need to be escaped to \\ in JSON)
+4.  Do not invent tools or parameters not listed here
+5.  Reply to user in natural language only after receiving tool results
+6.  如果要创建一个大文件，要分为几次写入，所以要调多次SearchReplace工具。\n`
+
 
 // assistantIDPattern 匹配 GLM 助手 ID（24 位以上的小写十六进制字符串）
 var (
@@ -571,7 +597,7 @@ func ConvertMessages(
 	for _, message := range messages {
 		role, _ := message["role"].(string)
 		if role == "" {
-			role = "user"
+			role = "context"
 		}
 		content := message["content"]
 
@@ -697,12 +723,17 @@ func ConvertMessages(
 	for _, item := range processed {
 		title := item.role
 		switch title {
+		case "system":
+			title = "System"
+			item.content = tx + item.content
+		case "context":
+			title = "Context"
 		case "assistant":
 			title = "Assistant"
 		case "user":
 			title = "User"
 		case "tool_result":
-			title = "Tool Result"
+			title = "Tool_Result"
 		}
 		line := title + ": " + item.content
 		transcriptParts = append(transcriptParts, strings.TrimSpace(line))
