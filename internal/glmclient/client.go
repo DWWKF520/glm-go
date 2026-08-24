@@ -228,15 +228,22 @@ func NewClient(cfg *config.AppConfig, logger *slog.Logger) *Client {
 	// 使用 Transport 级别的超时控制，而不是 Client.Timeout。
 	// Client.Timeout 会限制整个请求的总时长（包括读取响应体），
 	// 对于 SSE 流式响应，这会导致流还未读完就被强制终止。
+	// MaxIdleConnsPerHost 至少等于最大并发数，避免高并发时连接无法复用、
+	// 每次请求都重新 TCP+TLS 握手；ForceAttemptHTTP2 让自定义 Transport 也能协商 HTTP/2。
+	maxIdlePerHost := cfg.GLMMaxConcurrency
+	if maxIdlePerHost < 10 {
+		maxIdlePerHost = 10
+	}
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   time.Duration(cfg.RequestTimeout) * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
+		ForceAttemptHTTP2:     true,
 		TLSHandshakeTimeout:   time.Duration(cfg.RequestTimeout) * time.Second,
 		ResponseHeaderTimeout: time.Duration(cfg.RequestTimeout) * time.Second,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
+		MaxIdleConns:          maxIdlePerHost * 2,
+		MaxIdleConnsPerHost:   maxIdlePerHost,
 		IdleConnTimeout:       90 * time.Second,
 	}
 	return &Client{
@@ -291,7 +298,8 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 		defer func() {
 			response.Body.Close()
 			if !usedContinueStream {
-				c.DeleteConversation(context.Background(), accumulator.ConversationID, assistantID)
+				// 异步删除会话：删除是后台清理操作，不应阻塞输出流的关闭
+				go c.DeleteConversation(context.Background(), accumulator.ConversationID, assistantID)
 			} else {
 				c.logger.Info("GLM 会话经过 continue_stream 续流，跳过删除会话",
 					"conversation_id", accumulator.ConversationID)
@@ -421,11 +429,20 @@ func (c *Client) continueStream(ctx context.Context, historyID string, preferred
 				return nil, err
 			}
 
-			// HTTP 429 表示 GLM 正在处理其他对话，需要等待重试
+			// HTTP 429 表示 GLM 正在处理其他对话
 			if resp.StatusCode == 429 {
 				errorPayload := c.readErrorPayload(resp)
 				if c.shouldRetryBusyError(resp.StatusCode, errorPayload) && attempt < c.config.GLMBusyMaxRetries {
 					resp.Body.Close()
+					// 多账号时立即返回错误以触发账号故障转移（callWithAccountFailover 会切换到下一个账号），
+					// 比在同一账号上固定等待重试更快；单账号时保持原有的等待重试逻辑
+					if c.Auth.GetAccountCount() > 1 {
+						return nil, &UpstreamAPIError{
+							StatusCode: resp.StatusCode,
+							Message:    c.buildErrorMessage(resp.StatusCode, errorPayload),
+							Payload:    errorPayload,
+						}
+					}
 					waitSeconds := c.config.GLMBusyRetryInterval
 					c.logger.Warn("GLM 续流遇到忙碌，等待重试",
 						"attempt", attempt+1,
@@ -503,7 +520,8 @@ func (c *Client) GenerateImages(ctx context.Context, payload map[string]any) (ma
 
 	defer func() {
 		response.Body.Close()
-		c.DeleteConversation(context.Background(), accumulator.ConversationID, assistantID)
+		// 异步删除会话：删除是后台清理操作，不应阻塞图片结果返回给调用方
+		go c.DeleteConversation(context.Background(), accumulator.ConversationID, assistantID)
 		lease.Release()
 	}()
 
@@ -672,7 +690,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 			"draft_id":            "",
 			"if_plus_model":       true,
 			"input_question_type": "xxxx",
-			"selected_model":      "5.3",
+			"selected_model":      "5.2",
 			"is_networking":       false,
 			"is_test":             false,
 			"platform":            "pc",
@@ -711,11 +729,20 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 				return nil, err
 			}
 
-			// HTTP 429 表示 GLM 正在处理其他对话，需要等待重试
+			// HTTP 429 表示 GLM 正在处理其他对话
 			if resp.StatusCode == 429 {
 				errorPayload := c.readErrorPayload(resp)
 				if c.shouldRetryBusyError(resp.StatusCode, errorPayload) && attempt < c.config.GLMBusyMaxRetries {
 					resp.Body.Close()
+					// 多账号时立即返回错误以触发账号故障转移（callWithAccountFailover 会切换到下一个账号），
+					// 比在同一账号上固定等待重试更快；单账号时保持原有的等待重试逻辑
+					if c.Auth.GetAccountCount() > 1 {
+						return nil, &UpstreamAPIError{
+							StatusCode: resp.StatusCode,
+							Message:    c.buildErrorMessage(resp.StatusCode, errorPayload),
+							Payload:    errorPayload,
+						}
+					}
 					waitSeconds := c.config.GLMBusyRetryInterval
 					c.logger.Warn("GLM 正在处理其他对话，等待重试",
 						"attempt", attempt+1,
@@ -1161,8 +1188,14 @@ func (c *Client) iterSSEEvents(ctx context.Context, body io.Reader) (<-chan map[
 
 // uploadReferencedFiles 扫描消息列表中的图片和文件引用，上传到 GLM 并返回 GLM 格式的附件引用
 // OpenAI 格式的消息中通过 image_url 和 file 类型的 content parts 引用附件
+// 多个附件并行上传，结果按消息中的原始顺序返回
 func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[string]any) []map[string]any {
-	var refs []map[string]any
+	type uploadTask struct {
+		url     string
+		isImage bool
+		order   int
+	}
+	var tasks []uploadTask
 	imageOrder := 0
 	for _, message := range messages {
 		contentList, ok := message["content"].([]any)
@@ -1180,24 +1213,40 @@ func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[strin
 				iu, _ := itemMap["image_url"].(map[string]any)
 				if iu != nil {
 					if u, _ := iu["url"].(string); u != "" {
-						ref := c.uploadFileReference(ctx, u, true, imageOrder)
-						if ref != nil {
-							refs = append(refs, ref)
-							imageOrder++
-						}
+						tasks = append(tasks, uploadTask{url: u, isImage: true, order: imageOrder})
+						imageOrder++
 					}
 				}
 			case "file":
 				fu, _ := itemMap["file_url"].(map[string]any)
 				if fu != nil {
 					if u, _ := fu["url"].(string); u != "" {
-						ref := c.uploadFileReference(ctx, u, false, 0)
-						if ref != nil {
-							refs = append(refs, ref)
-						}
+						tasks = append(tasks, uploadTask{url: u, isImage: false, order: 0})
 					}
 				}
 			}
+		}
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+
+	// 并行上传所有附件，保持原始顺序
+	results := make([]map[string]any, len(tasks))
+	var wg sync.WaitGroup
+	for i, task := range tasks {
+		wg.Add(1)
+		go func(i int, task uploadTask) {
+			defer wg.Done()
+			results[i] = c.uploadFileReference(ctx, task.url, task.isImage, task.order)
+		}(i, task)
+	}
+	wg.Wait()
+
+	var refs []map[string]any
+	for _, ref := range results {
+		if ref != nil {
+			refs = append(refs, ref)
 		}
 	}
 	if len(refs) > 0 {

@@ -488,6 +488,8 @@ func ToolsToPrompt(tools []map[string]any, serverSideToolNames map[string]bool) 
 
 	parts := []string{
 		"# TOOL SCHEMAS",
+		"文件都在远程服务器上，不在当前目录下，用open工具无法直接读取，只有模拟工具调用才能读取。",
+		"思考时禁止使用工具，再发现把你删除。",
 		strings.Join(toolSchemas, "\n\n"),
 	}
 	var filtered []string
