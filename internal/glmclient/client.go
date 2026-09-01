@@ -7,7 +7,6 @@ package glmclient
 //   - 多账号故障转移（callWithAccountFailover）：支持多个 GLM 账号轮换使用，单个账号失败时自动切换
 //   - 流式聊天补全（StreamChatCompletion）：将 OpenAI 格式的 chat 请求转换为 GLM 格式并转发
 //   - 图片生成（GenerateImages）：将 OpenAI 格式的 image 请求转发到 GLM 的 cogview 绘图接口
-//   - 文件上传（uploadReferencedFiles）：自动上传消息中的图片和文件附件到 GLM
 //   - SSE 流解析（iterSSEEvents）：解析 GLM 返回的 Server-Sent Events 流
 //   - 错误处理与重试：包括忙碌重试、游客账号重试、错误事件过滤等
 //
@@ -29,11 +28,8 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
-	"mime/multipart"
 	"net"
 	"net/http"
-	"net/url"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -657,26 +653,6 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "OpenAI 原始 chat 请求 payload", openaiPayload)
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "转换后的 GLM messages", convertedMessages)
 
-	// 上传消息中引用的图片和文件，并将上传结果附加到消息中
-	refs := c.uploadReferencedFiles(ctx, getMessagesList(openaiPayload))
-	if len(refs) > 0 {
-		if len(convertedMessages) > 0 {
-			contentList, _ := convertedMessages[0]["content"].([]map[string]any)
-			for i, item := range contentList {
-				if t, _ := item["type"].(string); t == "text" {
-					if text, _ := item["text"].(string); text != "" {
-						// 清理文本中的图片引用标记（已通过上传方式传递）
-						cleaned := translator.ImageRefRE.ReplaceAllString(text, "")
-						cleaned = strings.TrimSpace(cleaned)
-						contentList[i]["text"] = cleaned
-					}
-				}
-			}
-			convertedMessages[0]["content"] = append(contentList, refs...)
-			logging.DebugDump(c.logger, c.config.DebugDumpAll, "附加上传引用后的 GLM messages", convertedMessages)
-		}
-	}
-
 	// 构建 GLM API 请求体
 	requestBody := map[string]any{
 		"assistant_id":    assistantID,
@@ -686,11 +662,11 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 		"messages":        convertedMessages,
 		"meta_data": map[string]any{
 			"channel":             "",
-			"chat_mode":           "thinking", // 启用思考模式
+			"chat_mode":           "thinking", // 启用思考模式"deep_"
 			"draft_id":            "",
 			"if_plus_model":       true,
 			"input_question_type": "xxxx",
-			"selected_model":      "5.2",
+			"selected_model":      "glm-5.3", //glm-5.3-flash
 			"is_networking":       false,
 			"is_test":             false,
 			"platform":            "pc",
@@ -1184,274 +1160,6 @@ func (c *Client) iterSSEEvents(ctx context.Context, body io.Reader) (<-chan map[
 		scanErrCh <- nil
 	}()
 	return out, scanErrCh
-}
-
-// uploadReferencedFiles 扫描消息列表中的图片和文件引用，上传到 GLM 并返回 GLM 格式的附件引用
-// OpenAI 格式的消息中通过 image_url 和 file 类型的 content parts 引用附件
-// 多个附件并行上传，结果按消息中的原始顺序返回
-func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[string]any) []map[string]any {
-	type uploadTask struct {
-		url     string
-		isImage bool
-		order   int
-	}
-	var tasks []uploadTask
-	imageOrder := 0
-	for _, message := range messages {
-		contentList, ok := message["content"].([]any)
-		if !ok {
-			continue
-		}
-		for _, item := range contentList {
-			itemMap, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			itemType, _ := itemMap["type"].(string)
-			switch itemType {
-			case "image_url":
-				iu, _ := itemMap["image_url"].(map[string]any)
-				if iu != nil {
-					if u, _ := iu["url"].(string); u != "" {
-						tasks = append(tasks, uploadTask{url: u, isImage: true, order: imageOrder})
-						imageOrder++
-					}
-				}
-			case "file":
-				fu, _ := itemMap["file_url"].(map[string]any)
-				if fu != nil {
-					if u, _ := fu["url"].(string); u != "" {
-						tasks = append(tasks, uploadTask{url: u, isImage: false, order: 0})
-					}
-				}
-			}
-		}
-	}
-	if len(tasks) == 0 {
-		return nil
-	}
-
-	// 并行上传所有附件，保持原始顺序
-	results := make([]map[string]any, len(tasks))
-	var wg sync.WaitGroup
-	for i, task := range tasks {
-		wg.Add(1)
-		go func(i int, task uploadTask) {
-			defer wg.Done()
-			results[i] = c.uploadFileReference(ctx, task.url, task.isImage, task.order)
-		}(i, task)
-	}
-	wg.Wait()
-
-	var refs []map[string]any
-	for _, ref := range results {
-		if ref != nil {
-			refs = append(refs, ref)
-		}
-	}
-	if len(refs) > 0 {
-		c.logger.Info("上传附件完成", "成功数", len(refs))
-	}
-	return refs
-}
-
-// uploadFileReference 上传单个文件到 GLM 文件服务
-// 支持图片和普通文件两种类型，返回 GLM 格式的附件引用对象
-//
-// 流程：
-//  1. 通过 fetchFilePayload 获取文件内容（支持 data: URL 和远程 URL）
-//  2. 构建 multipart/form-data 请求体
-//  3. 通过账号故障转移机制发送上传请求
-//  4. 解析响应，构建 GLM 格式的附件引用
-func (c *Client) uploadFileReference(ctx context.Context, fileURL string, isImage bool, order int) map[string]any {
-	filename, mimeType, payload, err := c.fetchFilePayload(fileURL)
-	if err != nil {
-		c.logger.Warn("上传附件失败", "url", fileURL, "error", err)
-		return nil
-	}
-
-	// 构建 multipart/form-data 请求体
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile("file", filename)
-	if err != nil {
-		c.logger.Warn("上传附件失败", "url", fileURL, "error", err)
-		return nil
-	}
-	if _, err := part.Write(payload); err != nil {
-		c.logger.Warn("上传附件失败", "url", fileURL, "error", err)
-		return nil
-	}
-	if err := writer.Close(); err != nil {
-		c.logger.Warn("上传附件失败", "url", fileURL, "error", err)
-		return nil
-	}
-	boundary := writer.Boundary()
-
-	uploadURL := c.config.FileUploadURL()
-	logging.DebugDump(c.logger, c.config.DebugDumpAll, fmt.Sprintf("准备上传附件 url=%s filename=%s mime=%s", fileURL, filename, mimeType), map[string]any{
-		"filename": filename, "mime_type": mimeType, "bytes": len(payload),
-	})
-
-	operation := func(accountIndex int, accessToken string) (any, error) {
-		timestamp, nonce, sign := auth.BuildSign()
-		req, err := http.NewRequestWithContext(ctx, "POST", uploadURL, bytes.NewReader(body.Bytes()))
-		if err != nil {
-			return nil, err
-		}
-		headers := c.Auth.GetBrowserHeaders("")
-		headers["Authorization"] = "Bearer " + accessToken
-		headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
-		headers["Referer"] = "https://chatglm.cn/"
-		headers["X-Device-Id"] = uuid.New().String()
-		headers["X-Nonce"] = nonce
-		headers["X-Request-Id"] = uuid.New().String()
-		headers["X-Sign"] = sign
-		headers["X-Timestamp"] = timestamp
-		for k, v := range headers {
-			req.Header.Set(k, v)
-		}
-		return c.httpClient.Do(req)
-	}
-
-	respAny, err := c.callWithAccountFailover(ctx, "file_upload", operation, nil)
-	if err != nil {
-		c.logger.Warn("上传附件失败", "url", fileURL, "error", err)
-		return nil
-	}
-	resp, ok := respAny.(*http.Response)
-	if !ok || resp == nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	payload2, err := c.Auth.ReadJSONResponse(resp)
-	if err != nil {
-		c.logger.Warn("上传附件读取响应失败", "url", fileURL, "error", err)
-		return nil
-	}
-	result, _ := payload2["result"].(map[string]any)
-	logging.DebugDump(c.logger, c.config.DebugDumpAll, "GLM 文件上传响应 result", result)
-	sourceID, _ := result["file_id"].(string)
-	if sourceID == "" {
-		return nil
-	}
-
-	// 根据文件类型构建不同的引用格式
-	if isImage {
-		fileName, _ := result["file_name"].(string)
-		if fileName == "" {
-			fileName = filename
-		}
-		fileURLResult, _ := result["file_url"].(string)
-		if fileURLResult == "" {
-			fileURLResult = fileURL
-		}
-		fileSize := 0
-		if fs, ok := result["file_size"].(float64); ok {
-			fileSize = int(fs)
-		}
-		if fileSize == 0 {
-			fileSize = len(payload)
-		}
-		width := 0
-		if w, ok := result["width"].(float64); ok {
-			width = int(w)
-		}
-		height := 0
-		if h, ok := result["height"].(float64); ok {
-			height = int(h)
-		}
-		return map[string]any{
-			"type": "image",
-			"image": []map[string]any{
-				{
-					"file_name": fileName,
-					"file_id":   sourceID,
-					"image_url": fileURLResult,
-					"file_size": fileSize,
-					"order":     order,
-					"width":     width,
-					"height":    height,
-				},
-			},
-		}
-	}
-	fileURLResult, _ := result["file_url"].(string)
-	if fileURLResult == "" {
-		fileURLResult = fileURL
-	}
-	return map[string]any{
-		"type": "file",
-		"file": []map[string]any{
-			{"file_id": sourceID, "file_url": fileURLResult},
-		},
-	}
-}
-
-// fetchFilePayload 从 URL 或 data: URI 获取文件内容
-// 支持两种来源：
-//   - data: URI（如 data:image/png;base64,...）：直接解码 base64 内容
-//   - 远程 URL：通过 HTTP GET 下载
-//
-// 返回值：(文件名, MIME 类型, 文件内容, 错误)
-func (c *Client) fetchFilePayload(fileURL string) (string, string, []byte, error) {
-	// 处理 data: URI 格式
-	if strings.HasPrefix(fileURL, "data:") {
-		commaIdx := strings.Index(fileURL, ",")
-		if commaIdx == -1 {
-			return "", "", nil, fmt.Errorf("无效的 data URL")
-		}
-		header := fileURL[:commaIdx]
-		encoded := fileURL[commaIdx+1:]
-		mimeType := ""
-		if strings.HasPrefix(header, "data:") {
-			semiIdx := strings.Index(header, ";")
-			if semiIdx > 5 {
-				mimeType = header[5:semiIdx]
-			}
-		}
-		if mimeType == "" {
-			mimeType = "application/octet-stream"
-		}
-		ext := filepath.Ext(mimeType)
-		if ext == "" {
-			ext = ".bin"
-		}
-		payload, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			return "", "", nil, err
-		}
-		filename := "upload-" + strings.ReplaceAll(uuid.New().String(), "-", "") + ext
-		return filename, mimeType, payload, nil
-	}
-
-	// 处理远程 URL
-	parsed, err := url.Parse(fileURL)
-	if err != nil {
-		return "", "", nil, err
-	}
-	filename := filepath.Base(parsed.Path)
-	if filename == "" || filename == "/" || filename == "." {
-		filename = "upload-" + strings.ReplaceAll(uuid.New().String(), "-", "") + ".bin"
-	}
-
-	resp, err := c.httpClient.Get(fileURL)
-	if err != nil {
-		return "", "", nil, err
-	}
-	defer resp.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, FileSizeLimit+1))
-	if err != nil {
-		return "", "", nil, err
-	}
-	if len(payload) > FileSizeLimit {
-		return "", "", nil, fmt.Errorf("文件超过 100MB，拒绝上传")
-	}
-	mimeType := resp.Header.Get("Content-Type")
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
-	return filename, mimeType, payload, nil
 }
 
 // readErrorPayload 读取 HTTP 错误响应体并尝试解析为 JSON

@@ -60,7 +60,6 @@ Must prefer using the todos tool first.
 5.  Reply to user in natural language only after receiving tool results
 6.  如果要创建一个大文件，要分为几次写入，所以要调多次SearchReplace工具。\n`
 
-
 // assistantIDPattern 匹配 GLM 助手 ID（24 位以上的小写十六进制字符串）
 var (
 	assistantIDPattern = regexp.MustCompile(`^[a-z0-9]{24,}$`)
@@ -74,6 +73,56 @@ var (
 	// ImageRefRE 匹配 [image:url] 格式的图片引用标记
 	ImageRefRE = regexp.MustCompile(`\[image:[^\]]+\]`)
 )
+
+var (
+	// noInternetNote 追加到提示词中链接后的标注，提示 GLM 模型自身无法联网访问这些资源
+	noInternetNote = "（你未联网，要使用search相关工具）"
+	// urlOrNotePattern 匹配 URL（末尾可选组用于吞掉已存在的标注，保证重复转换时不会叠加标注）
+	urlOrNotePattern = regexp.MustCompile(`https?://[^\s<>()"']+(?:（你未联网，要使用search相关工具）)?`)
+)
+
+// AnnotateNoInternet 在文本中的链接后追加 "（你未联网，要使用search相关工具）" 标注。
+//
+// 用于入站转换：GLM 无法联网，用户消息中的 URL 若不加说明，
+// 模型可能尝试直接"访问"或编造其内容；追加标注可明确提示模型这些资源
+// 需要通过工具处理或让用户提供内容。已带标注的匹配不再重复追加（幂等）。
+func AnnotateNoInternet(text string) string {
+	if text == "" || !urlOrNotePattern.MatchString(text) {
+		return text
+	}
+	return urlOrNotePattern.ReplaceAllStringFunc(text, func(m string) string {
+		if strings.HasSuffix(m, noInternetNote) {
+			return m
+		}
+		return m + noInternetNote
+	})
+}
+
+// StripNoInternetNote 清除文本中的 "（你未联网，要使用search相关工具）" 标注（含半角括号变体）。
+//
+// 用于出站转换：模型偶尔会把提示词中的标注原样复制进工具调用参数
+// （如 url、file_path），返回给客户端前必须清除，避免污染真实参数值。
+func StripNoInternetNote(s string) string {
+	if !strings.Contains(s, "你未联网，要使用search相关工具") {
+		return s
+	}
+	r := strings.NewReplacer(
+		"（你未联网，要使用search相关工具）", "",
+		"(你未联网，要使用search相关工具)", "",
+		"（你未联网，要使用search相关工具)", "",
+		"(你未联网，要使用search相关工具）", "",
+	)
+	return strings.TrimSpace(r.Replace(s))
+}
+
+// stripNoInternetNoteArgs 清除参数 map 中所有字符串值里的 "（你未联网，要使用search相关工具）" 标注。
+func stripNoInternetNoteArgs(args map[string]any) {
+	for k, v := range args {
+		if s, ok := v.(string); ok {
+			args[k] = StripNoInternetNote(s)
+		}
+	}
+}
 
 // ExtractTextContent 从 OpenAI 消息的 content 字段中提取纯文本
 //
@@ -457,6 +506,9 @@ func SanitizeToolCallPayload(toolName string, arguments any, fallbackURL string,
 		}
 	}
 
+	// 清除模型复制进参数的 "（你未联网，要使用search相关工具）" 标注
+	stripNoInternetNoteArgs(cleaned)
+
 	// 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）
 	if len(paramTypes) > 0 {
 		for k, v := range cleaned {
@@ -608,6 +660,9 @@ func ConvertMessages(
 			if currentURL != "" {
 				latestUserURL = currentURL
 			}
+			// 在链接和文件路径后追加 "（你未联网，要使用search相关工具）" 标注
+			// （必须在提取 URL 之后进行，避免标注污染 fallback URL）
+			content = AnnotateNoInternet(currentText)
 		}
 
 		// 助手消息：将 OpenAI tool_calls 格式转换为 GLM [function_calls] 格式
@@ -893,7 +948,12 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 				if _, exists := a.partsByLogicID[logicID]; !exists {
 					a.insertSorted(logicID)
 				}
-				a.partsByLogicID[logicID] = part
+				if isIncreasePushPayload(payload) {
+					// 增量推送模式：part 内容只是本次新增片段，需合并进已累积的 part
+					a.partsByLogicID[logicID] = mergeIncrementalPart(a.partsByLogicID[logicID], part)
+				} else {
+					a.partsByLogicID[logicID] = part
+				}
 				a.renderCacheDirty = true
 			}
 			// 提取 GLM 服务端原生工具调用（后端自动执行的工具）
@@ -950,12 +1010,16 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 								}
 							}
 							if parsed != nil {
+								// 清除模型复制进参数的 "（你未联网，要使用search相关工具）" 标注
+								stripNoInternetNoteArgs(parsed)
 								argsStr = tools.SafeJSONDumpsCompact(coerceToolCallArgs(parsed, toolName, toolParamTypes))
 							} else {
-								argsStr = s
+								argsStr = StripNoInternetNote(s)
 							}
 						} else if argsMap, ok := arguments.(map[string]any); ok {
 							// map 类型：直接矫正
+							// 清除模型复制进参数的 "（你未联网，要使用search相关工具）" 标注
+							stripNoInternetNoteArgs(argsMap)
 							argsStr = tools.SafeJSONDumpsCompact(coerceToolCallArgs(argsMap, toolName, toolParamTypes))
 						} else if arguments != nil {
 							// 其他类型（如数字、布尔）：直接序列化
@@ -1176,6 +1240,88 @@ func (a *GLMEventAccumulator) extractReasoningToolCalls(reasoningText string) []
 	}
 	_, toolCalls := tools.ParseToolCallsFromText(strings.TrimSpace(source))
 	return SanitizeToolCalls(toolCalls, a.FallbackToolURL, a.ToolsList)
+}
+
+// isIncreasePushPayload 判断事件是否为增量推送模式（meta_data.if_increase_push=true）。
+// 该模式下 part 的 text/think 内容只包含本次新增的片段而非全量快照，
+// 必须合并到已累积的 part 上，否则 computeDeltas 的 prevLen 截断会破坏流式文本
+// （例如把 [function_calls] 标记拆散，导致工具调用解析失败）。
+func isIncreasePushPayload(payload map[string]any) bool {
+	meta, ok := payload["meta_data"].(map[string]any)
+	if !ok {
+		return false
+	}
+	increase, _ := meta["if_increase_push"].(bool)
+	return increase
+}
+
+// mergeIncrementalPart 将增量片段 part 合并到已累积的 existing part。
+// text/think 内容追加到同类型内容的最后一项，其他内容（如 tool_calls）直接追加；
+// part 的其余字段（status、meta_data 等）以片段中的最新值为准。
+// existing 为 nil 时等价于直接使用 fragment。
+func mergeIncrementalPart(existing, fragment map[string]any) map[string]any {
+	if existing == nil {
+		return fragment
+	}
+
+	merged := map[string]any{}
+	for k, v := range existing {
+		merged[k] = v
+	}
+	for k, v := range fragment {
+		merged[k] = v
+	}
+
+	existingContent, _ := existing["content"].([]any)
+	fragmentContent, _ := fragment["content"].([]any)
+	if len(existingContent) == 0 || len(fragmentContent) == 0 {
+		merged["content"] = fragmentContent
+		return merged
+	}
+
+	content := make([]any, len(existingContent))
+	copy(content, existingContent)
+	for _, fc := range fragmentContent {
+		item, ok := fc.(map[string]any)
+		if !ok {
+			content = append(content, fc)
+			continue
+		}
+		itemType, _ := item["type"].(string)
+		var field string
+		switch itemType {
+		case "text":
+			field = "text"
+		case "think":
+			field = "think"
+		default:
+			content = append(content, item)
+			continue
+		}
+		// 追加到已累积内容中同类型的最后一项
+		appended := false
+		for i := len(content) - 1; i >= 0; i-- {
+			prev, ok := content[i].(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := prev["type"].(string); t == itemType {
+				fragText, _ := item[field].(string)
+				if prevText, ok := prev[field].(string); ok {
+					prev[field] = prevText + fragText
+				} else {
+					prev[field] = fragText
+				}
+				appended = true
+				break
+			}
+		}
+		if !appended {
+			content = append(content, item)
+		}
+	}
+	merged["content"] = content
+	return merged
 }
 
 // computeDeltas 计算本次事件相对于上次的文本和推理内容增量

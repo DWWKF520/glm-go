@@ -98,11 +98,11 @@ func TestConsumeEventToolCallComplete(t *testing.T) {
 // TestExtractEmbeddedArgsFromName 验证从 name 字段中分离嵌入参数的逻辑
 func TestExtractEmbeddedArgsFromName(t *testing.T) {
 	tests := []struct {
-		name       string
-		input      string
-		wantName   string
-		wantArgs   map[string]any
-		wantOk     bool
+		name     string
+		input    string
+		wantName string
+		wantArgs map[string]any
+		wantOk   bool
 	}{
 		{
 			name:     "标准嵌入参数",
@@ -130,9 +130,9 @@ func TestExtractEmbeddedArgsFromName(t *testing.T) {
 			input:    `Edit{"file_path":"/a/b.go","old_string":"x","new_string":"y"}`,
 			wantName: "Edit",
 			wantArgs: map[string]any{
-				"file_path":   "/a/b.go",
-				"old_string":  "x",
-				"new_string":  "y",
+				"file_path":  "/a/b.go",
+				"old_string": "x",
+				"new_string": "y",
 			},
 			wantOk: true,
 		},
@@ -250,7 +250,7 @@ func TestExtractEmbeddedArgsFromName(t *testing.T) {
 // TestArgumentsIsEmpty 验证判断 arguments 是否为空的逻辑
 func TestArgumentsIsEmpty(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		input any
 		want  bool
 	}{
@@ -387,8 +387,8 @@ func TestConsumeEventServerSideToolCallTruncatedArgs(t *testing.T) {
 					map[string]any{
 						"type": "tool_calls",
 						"tool_calls": map[string]any{
-							"id":   "tool-1",
-							"name": "WebSearch",
+							"id":        "tool-1",
+							"name":      "WebSearch",
 							"arguments": `{"query": "灵巧手 仿生手 机器人技术 发展趋势", "num": "5", "lr": "lang_zh"`,
 						},
 					},
@@ -686,5 +686,201 @@ func TestCoerceToolCallArgs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestConsumeEventIncrementalPushToolCall 复现 2026-08-28 日志场景：
+// GLM 开启 if_increase_push 增量推送后，[function_calls] 块被拆成多个片段事件下发，
+// 最终事件（if_increase_push=false）携带全量文本。修复前 part 被整体替换、
+// computeDeltas 按 prevLen 截断片段开头，导致标记被拆散、工具调用解析为 0。
+func TestConsumeEventIncrementalPushToolCall(t *testing.T) {
+	acc := NewGLMEventAccumulator("model", "", nil, false, nil)
+
+	fullText := "[function_calls]\n" +
+		`[call:todo_write]{"todos":[{"content":"检查 API 密钥","status":"in_progress"}]}[/call]` + "\n" +
+		`[call:bash]{"command":"echo hi"}[/call]` + "\n" +
+		"[/function_calls]"
+
+	// 按日志中的实际上游切片方式拆分片段：标记跨片段边界
+	fragments := []string{"[", "function", "_calls", "]\n", "[", "call:todo_write]{\"todos\":[{\"content\":\"检查 API 密钥\",\"status\":\"in_progress\"}]}[/call]\n", "[call:bash]{\"command\":\"echo hi\"}[/call]\n", "[/function_calls]"}
+	for _, frag := range fragments {
+		event := map[string]any{
+			"meta_data": map[string]any{"if_increase_push": true},
+			"parts": []any{
+				map[string]any{
+					"logic_id": "part1",
+					"content": []any{
+						map[string]any{"type": "text", "text": frag},
+					},
+				},
+			},
+			"status": "init",
+		}
+		chunks, status := acc.ConsumeEvent(event)
+		if status == "finish" || status == "tool_call_complete" {
+			t.Fatalf("unexpected early status %q", status)
+		}
+		// 工具调用块不应作为可见文本输出
+		for _, chunk := range chunks {
+			if strings.Contains(chunk, "function_calls") || strings.Contains(chunk, "todo_write") {
+				t.Fatalf("tool call marker leaked as visible text: %s", chunk)
+			}
+		}
+	}
+
+	// 最终全量快照事件（if_increase_push=false, status=finish）
+	finalEvent := map[string]any{
+		"meta_data": map[string]any{"if_increase_push": false},
+		"parts": []any{
+			map[string]any{
+				"logic_id": "part1",
+				"content": []any{
+					map[string]any{"type": "text", "text": fullText},
+				},
+			},
+		},
+		"status": "finish",
+	}
+	_, status := acc.ConsumeEvent(finalEvent)
+	if !acc.toolParser.IsToolCallCompleted() {
+		t.Fatal("expected tool call to be completed after full snapshot event")
+	}
+
+	finishChunks := acc.Finalize(status, nil)
+	joined := strings.Join(finishChunks, "")
+	if !strings.Contains(joined, "todo_write") || !strings.Contains(joined, "bash") {
+		t.Fatalf("finalize chunks missing tool calls: %s", joined)
+	}
+	if !strings.Contains(joined, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("finalize chunks missing finish_reason=tool_calls: %s", joined)
+	}
+}
+
+// TestAnnotateNoInternet 验证用户消息中的链接会被追加 "（你没有联网）" 标注，文件路径不标注
+func TestAnnotateNoInternet(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{
+			name: "http URL",
+			in:   "请看这个链接 https://example.com/docs 谢谢",
+			want: "请看这个链接 https://example.com/docs（你没有联网） 谢谢",
+		},
+		{
+			name: "Unix 路径不标注",
+			in:   "帮我读取 /home/wkf/glm-go/go.mod 文件",
+			want: "帮我读取 /home/wkf/glm-go/go.mod 文件",
+		},
+		{
+			name: "Windows 路径不标注",
+			in:   "打开 e:\\project\\src\\app.tsx 看看",
+			want: "打开 e:\\project\\src\\app.tsx 看看",
+		},
+		{
+			name: "无链接",
+			in:   "普通文本，没有链接",
+			want: "普通文本，没有链接",
+		},
+		{
+			name: "已标注的 URL 不重复追加（幂等）",
+			in:   "看 https://example.com/a（你没有联网） 这个",
+			want: "看 https://example.com/a（你没有联网） 这个",
+		},
+	}
+	for _, c := range cases {
+		if got := AnnotateNoInternet(c.in); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestStripNoInternetNote 验证出站时清除工具参数中的 "（你没有联网）" 标注
+func TestStripNoInternetNote(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{name: "全角括号", in: "https://example.com（你没有联网）", want: "https://example.com"},
+		{name: "半角括号", in: "https://example.com (你没有联网)", want: "https://example.com"},
+		{name: "路径中间", in: "/home/wkf/a.txt（你没有联网）", want: "/home/wkf/a.txt"},
+		{name: "无标注", in: "https://example.com", want: "https://example.com"},
+		{name: "纯标注", in: "（你没有联网）", want: ""},
+	}
+	for _, c := range cases {
+		if got := StripNoInternetNote(c.in); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestConvertMessagesAnnotatesUserURL 验证 ConvertMessages 对用户消息中的 URL 追加标注，
+// 且 fallback URL 不被标注污染
+func TestConvertMessagesAnnotatesUserURL(t *testing.T) {
+	messages := []map[string]any{
+		{"role": "user", "content": "总结 https://example.com/article 的内容"},
+	}
+	result := ConvertMessages(messages, nil, nil)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+	content, _ := result[0]["content"].([]map[string]any)
+	if len(content) == 0 {
+		t.Fatal("expected content list")
+	}
+	text, _ := content[0]["text"].(string)
+	want := "https://example.com/article（你没有联网）"
+	if !strings.Contains(text, want) {
+		t.Errorf("prompt missing annotation %q, got %q", want, text)
+	}
+}
+
+// TestSanitizeToolCallPayloadStripsNote 验证工具调用参数中的标注被清除
+func TestSanitizeToolCallPayloadStripsNote(t *testing.T) {
+	arguments := `{"url":"https://example.com/data（你没有联网）"}`
+	paramTypes := map[string]string{"url": "string"}
+	cleaned := SanitizeToolCallPayload("read", arguments, "", paramTypes)
+	if cleaned == nil {
+		t.Fatal("expected cleaned args, got nil")
+	}
+	if got, _ := cleaned["url"].(string); got != "https://example.com/data" {
+		t.Errorf("url = %q, want %q", got, "https://example.com/data")
+	}
+}
+
+// TestConsumeEventServerSideToolCallStripsNote 验证服务端工具调用参数中的标注被清除
+func TestConsumeEventServerSideToolCallStripsNote(t *testing.T) {
+	acc := NewGLMEventAccumulator("model", "", nil, false, nil)
+	event := map[string]any{
+		"conversation_id": "test-conv",
+		"parts": []any{
+			map[string]any{
+				"logic_id": "part1",
+				"content": []any{
+					map[string]any{
+						"type": "tool_calls",
+						"tool_calls": map[string]any{
+							"id":   "tool-1",
+							"name": "read",
+							"arguments": map[string]any{
+								"url": "https://example.com/page（你没有联网）",
+							},
+						},
+					},
+				},
+			},
+		},
+		"status": "processing",
+	}
+	acc.ConsumeEvent(event)
+	if len(acc.serverSideToolCalls) != 1 {
+		t.Fatalf("expected 1 server-side tool call, got %d", len(acc.serverSideToolCalls))
+	}
+	fn, _ := acc.serverSideToolCalls[0]["function"].(map[string]any)
+	args, _ := fn["arguments"].(string)
+	want := `"url":"https://example.com/page"`
+	if !strings.Contains(args, want) {
+		t.Errorf("args = %q, want to contain %q", args, want)
+	}
+	if strings.Contains(args, "你没有联网") {
+		t.Errorf("args still contains the note: %q", args)
 	}
 }
