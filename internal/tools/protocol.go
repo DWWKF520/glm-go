@@ -125,6 +125,15 @@ func ExtractEmbeddedArgsFromName(name string, knownToolNames ...string) (actualN
 	bracketIdx := strings.Index(name, "[")
 	if braceIdx > 0 && (bracketIdx < 0 || braceIdx < bracketIdx) {
 		candidate := strings.TrimSpace(name[:braceIdx])
+		// 兼容 GLM 把内联 [call:xxx]{...} 标记整体塞进 name 的情形：
+		// candidate 可能是 "call:todo_write]"，残留标记的 ']' 和 "call:" 前缀。
+		// 清理后仍是合法工具名才采用，避免误伤其他非法前缀。
+		if !isValidToolName(candidate) {
+			trimmed := strings.TrimPrefix(strings.TrimSuffix(candidate, "]"), "call:")
+			if isValidToolName(trimmed) {
+				candidate = trimmed
+			}
+		}
 		// candidate 必须是合法工具名（仅字母数字下划线），否则可能是数组格式的前缀
 		if candidate != "" && isValidToolName(candidate) {
 			jsonPart := name[braceIdx:]

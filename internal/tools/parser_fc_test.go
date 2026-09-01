@@ -10,11 +10,11 @@ import (
 
 func TestSplitStreamText_FunctionCalls(t *testing.T) {
 	tests := []struct {
-		name         string
-		input        string
-		final        bool
-		wantVisible  string
-		wantCalls    int
+		name          string
+		input         string
+		final         bool
+		wantVisible   string
+		wantCalls     int
 		wantRemainder bool
 	}{
 		{
@@ -32,11 +32,11 @@ func TestSplitStreamText_FunctionCalls(t *testing.T) {
 			wantCalls:   1,
 		},
 		{
-			name:        "不完整块 final=false 应保留在 remainder",
-			input:       "text [function_calls]\n[call:Skill]",
-			final:       false,
-			wantVisible: "text ",
-			wantCalls:   0,
+			name:          "不完整块 final=false 应保留在 remainder",
+			input:         "text [function_calls]\n[call:Skill]",
+			final:         false,
+			wantVisible:   "text ",
+			wantCalls:     0,
 			wantRemainder: true,
 		},
 		{
@@ -127,6 +127,84 @@ func TestParseToolCallsFromText_FunctionCalls(t *testing.T) {
 	}
 	if strings.Contains(cleaned, "[function_calls]") {
 		t.Errorf("cleaned text should not contain [function_calls]: %s", cleaned)
+	}
+}
+
+// TestExtractEmbeddedArgsFromName 验证 name 字段内嵌参数的分离逻辑。
+func TestExtractEmbeddedArgsFromName(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantName  string
+		wantArgs  map[string]any
+		wantOK    bool
+		knownTool string
+	}{
+		{
+			// 真实场景：GLM 把内联 [call:todo_write]{...} 标记整体塞进 name，
+			// 残留 ']' 和 "call:" 前缀；修复前会掉进 '_' 启发式，
+			// 错误产出 name="call:todo"、args={"write]{"todos": [...]}
+			name:     "内联标记整体塞入 name（call: 前缀 + 尾部 ]）",
+			input:    `call:todo_write]{"todos":[{"content":"加载 report-page 技能","status":"completed"}]}`,
+			wantName: "todo_write",
+			wantArgs: map[string]any{
+				"todos": []any{map[string]any{"content": "加载 report-page 技能", "status": "completed"}},
+			},
+			wantOK: true,
+		},
+		{
+			name:     "仅残留尾部 ]",
+			input:    `Read]{"file_path":"/tmp/a.txt"}`,
+			wantName: "Read",
+			wantArgs: map[string]any{"file_path": "/tmp/a.txt"},
+			wantOK:   true,
+		},
+		{
+			name:     "常规对象格式不受影响",
+			input:    `Read{"file_path":"C:\\path\\file.txt"}`,
+			wantName: "Read",
+			wantArgs: map[string]any{"file_path": `C:\path\file.txt`},
+			wantOK:   true,
+		},
+		{
+			name:      "数组格式不受影响",
+			input:     `TodoWritetodos[{"id":"1","content":"x"}]`,
+			knownTool: "TodoWrite",
+			wantName:  "TodoWrite",
+			wantArgs:  map[string]any{"todos": []any{map[string]any{"id": "1", "content": "x"}}},
+			wantOK:    true,
+		},
+		{
+			// 清理后仍非法（如纯垃圾前缀）不应被采用，避免误伤
+			name:     "清理后仍非法则不提取",
+			input:    `bad name!]{"a":1}`,
+			wantName: `bad name!]{"a":1}`,
+			wantOK:   false,
+		},
+		{
+			name:     "无内嵌参数原样返回",
+			input:    "todo_write",
+			wantName: "todo_write",
+			wantOK:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			known := []string{}
+			if tt.knownTool != "" {
+				known = append(known, tt.knownTool)
+			}
+			gotName, gotArgs, ok := ExtractEmbeddedArgsFromName(tt.input, known...)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v (name=%q args=%v)", ok, tt.wantOK, gotName, gotArgs)
+			}
+			if gotName != tt.wantName {
+				t.Errorf("name = %q, want %q", gotName, tt.wantName)
+			}
+			if tt.wantOK && !reflect.DeepEqual(gotArgs, tt.wantArgs) {
+				t.Errorf("args = %#v, want %#v", gotArgs, tt.wantArgs)
+			}
+		})
 	}
 }
 
