@@ -830,8 +830,27 @@ func buildMultipartBody(boundary, filename, mimeType string, payload []byte) []b
 	return buf.Bytes()
 }
 
+// commonMimeExtensions 常见 MIME 类型到扩展名的映射
+// Go 的 mime.ExtensionsByType 对部分类型返回的扩展名与常见习惯不符（如 text/plain → .asc），优先使用此映射
+var commonMimeExtensions = map[string]string{
+	"text/plain":             ".txt",
+	"text/csv":               ".csv",
+	"text/markdown":          ".md",
+	"text/html":              ".html",
+	"text/css":               ".css",
+	"image/jpeg":             ".jpg",
+	"image/tiff":             ".tif",
+	"image/svg+xml":          ".svg",
+	"application/json":       ".json",
+	"application/pdf":        ".pdf",
+	"application/javascript": ".js",
+}
+
 // extensionForMime 根据 MIME 类型推测文件扩展名，无法识别时返回 ".bin"
 func extensionForMime(mimeType string) string {
+	if ext, ok := commonMimeExtensions[mimeType]; ok {
+		return ext
+	}
 	if exts, err := mime.ExtensionsByType(mimeType); err == nil && len(exts) > 0 {
 		return exts[0]
 	}
