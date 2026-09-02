@@ -124,17 +124,6 @@ func stripNoInternetNoteArgs(args map[string]any) {
 	}
 }
 
-// ExtractTextContent 从 OpenAI 消息的 content 字段中提取纯文本
-//
-// 支持三种 content 格式：
-//   - string：直接返回
-//   - map[string]any：序列化为 JSON 字符串返回
-//   - []any（多模态内容列表）：按类型分别处理：
-//   - "text" → 提取文本
-//   - "image_url" → 转换为 [image:url] 格式
-//   - "file" → 转换为 [file:url] 格式
-//
-// 多个内容片段用换行符连接
 func ExtractTextContent(content any) string {
 	switch v := content.(type) {
 	case string:
@@ -154,18 +143,6 @@ func ExtractTextContent(content any) string {
 				if t, ok := m["text"]; ok && t != nil {
 					parts = append(parts, fmt.Sprintf("%v", t))
 				}
-			case "image_url":
-				url := ""
-				if iu, ok := m["image_url"].(map[string]any); ok {
-					url, _ = iu["url"].(string)
-				}
-				parts = append(parts, "[image:"+url+"]")
-			case "file":
-				url := ""
-				if fu, ok := m["file_url"].(map[string]any); ok {
-					url, _ = fu["url"].(string)
-				}
-				parts = append(parts, "[file:"+url+"]")
 			}
 		}
 		return strings.Join(filterEmpty(parts), "\n")

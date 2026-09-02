@@ -117,7 +117,7 @@ func (c *AppConfig) DeleteConversationURL() string {
 
 // FileUploadURL 文件上传 URL
 func (c *AppConfig) FileUploadURL() string {
-	return c.GLMBaseURL + "/backend-api/assistant/file_upload"
+	return c.GLMBaseURL + "/productivity-api/file/chat_upload"
 }
 
 // ParseDotenv 解析 .env 文件
