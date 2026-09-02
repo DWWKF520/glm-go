@@ -28,8 +28,11 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"mime"
 	"net"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -629,6 +632,212 @@ func (c *Client) resolveTools(openaiPayload map[string]any) []map[string]any {
 	return rawTools
 }
 
+// uploadReferencedFiles 扫描 OpenAI 消息中引用的图片和文件附件并上传到 GLM
+// 返回可作为 GLM 消息 content 前缀的引用列表（image_url / file 结构）
+func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[string]any) []map[string]any {
+	var refs []map[string]any
+	for _, message := range messages {
+		content, ok := message["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawItem := range content {
+			item, ok := rawItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			itemType, _ := item["type"].(string)
+			var url string
+			isImage := false
+			switch itemType {
+			case "image_url":
+				url = getContentItemURL(item, "image_url")
+				isImage = true
+			case "file":
+				url = getContentItemURL(item, "file_url")
+			default:
+				continue
+			}
+			if url == "" {
+				continue
+			}
+			ref := c.uploadFileReference(ctx, url, isImage)
+			if ref != nil {
+				refs = append(refs, ref)
+			}
+		}
+	}
+	if len(refs) > 0 {
+		c.logger.Info("上传附件完成", "success_count", len(refs))
+	}
+	return refs
+}
+
+// getContentItemURL 从 content item 的嵌套对象中提取 url 字段（如 image_url.url / file_url.url）
+func getContentItemURL(item map[string]any, key string) string {
+	obj, ok := item[key].(map[string]any)
+	if !ok {
+		return ""
+	}
+	url, _ := obj["url"].(string)
+	return url
+}
+
+// uploadFileReference 下载文件并通过 GLM file_upload 接口上传，返回引用结构
+// 上传失败时记录警告并返回 nil（不阻断聊天请求）
+func (c *Client) uploadFileReference(ctx context.Context, fileURL string, isImage bool) map[string]any {
+	filename, mimeType, payload, err := c.fetchFilePayload(ctx, fileURL)
+	if err != nil {
+		c.logger.Warn("上传附件失败", "url", fileURL, "error", err)
+		return nil
+	}
+	boundary := "glmgo" + strings.ReplaceAll(uuid.New().String(), "-", "")
+	body := buildMultipartBody(boundary, filename, mimeType, payload)
+	uploadURL := c.config.FileUploadURL()
+	logging.DebugDump(c.logger, c.config.DebugDumpAll, "准备上传附件",
+		map[string]any{"url": fileURL, "filename": filename, "mime_type": mimeType, "bytes": len(payload)})
+
+	operation := func(accountIndex int, accessToken string) (any, error) {
+		timestamp, nonce, sign := auth.BuildSign()
+		req, err := http.NewRequestWithContext(ctx, "POST", uploadURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		headers := c.Auth.GetBrowserHeaders("")
+		headers["Authorization"] = "Bearer " + accessToken
+		headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
+		headers["Referer"] = "https://chatglm.cn/"
+		headers["X-Device-Id"] = uuid.New().String()
+		headers["X-Nonce"] = nonce
+		headers["X-Request-Id"] = uuid.New().String()
+		headers["X-Sign"] = sign
+		headers["X-Timestamp"] = timestamp
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		logging.DebugDump(c.logger, c.config.DebugDumpAll, fmt.Sprintf("转发到 GLM 的 file_upload 请求头 account=%d", accountIndex), headers)
+		return c.httpClient.Do(req)
+	}
+
+	respAny, err := c.callWithAccountFailover(ctx, "file_upload", operation, nil)
+	if err != nil {
+		c.logger.Warn("上传附件失败", "url", fileURL, "error", err)
+		return nil
+	}
+	resp, ok := respAny.(*http.Response)
+	if !ok || resp == nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	resultPayload, err := c.Auth.ReadJSONResponse(resp)
+	if err != nil {
+		c.logger.Warn("上传附件读取响应失败", "url", fileURL, "error", err)
+		return nil
+	}
+	result, _ := resultPayload["result"].(map[string]any)
+	logging.DebugDump(c.logger, c.config.DebugDumpAll, "GLM 文件上传响应 result", result)
+	sourceID, _ := result["source_id"].(string)
+	fileResultURL, _ := result["file_url"].(string)
+	if fileResultURL == "" {
+		fileResultURL = fileURL
+	}
+	if sourceID == "" {
+		return nil
+	}
+	if isImage {
+		url := fileResultURL
+		if url == "" {
+			url = sourceID
+		}
+		return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}
+	}
+	return map[string]any{"type": "file", "file": []map[string]any{{"source_id": sourceID, "file_url": fileResultURL}}}
+}
+
+// fetchFilePayload 获取待上传文件的内容
+// 支持 data URL（base64 编码）和 HTTP(S) 链接下载，返回 (文件名, MIME 类型, 文件内容)
+func (c *Client) fetchFilePayload(ctx context.Context, fileURL string) (string, string, []byte, error) {
+	if strings.HasPrefix(fileURL, "data:") {
+		header, encoded, found := strings.Cut(fileURL, ",")
+		if !found {
+			return "", "", nil, fmt.Errorf("无效的 data URL")
+		}
+		mimeType := strings.TrimPrefix(strings.Split(header, ";")[0], "data:")
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		payload, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return "", "", nil, fmt.Errorf("解码 data URL 失败: %w", err)
+		}
+		return fmt.Sprintf("upload-%s%s", uuid.New().String(), extensionForMime(mimeType)), mimeType, payload, nil
+	}
+
+	parsed, err := url.Parse(fileURL)
+	if err != nil {
+		return "", "", nil, err
+	}
+	filename := parsed.Path
+	if idx := strings.LastIndex(filename, "/"); idx >= 0 {
+		filename = filename[idx+1:]
+	}
+	if filename == "" {
+		filename = fmt.Sprintf("upload-%s.bin", uuid.New().String())
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", fileURL, nil)
+	if err != nil {
+		return "", "", nil, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", "", nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", nil, fmt.Errorf("下载文件失败 HTTP %d", resp.StatusCode)
+	}
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, FileSizeLimit+1))
+	if err != nil {
+		return "", "", nil, err
+	}
+	if len(payload) > FileSizeLimit {
+		return "", "", nil, fmt.Errorf("文件超过 100MB，拒绝上传。")
+	}
+	mimeType := resp.Header.Get("Content-Type")
+	if idx := strings.Index(mimeType, ";"); idx >= 0 {
+		mimeType = strings.TrimSpace(mimeType[:idx])
+	}
+	if mimeType == "" {
+		if t := mime.TypeByExtension(filepath.Ext(filename)); t != "" {
+			mimeType = t
+		}
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	return filename, mimeType, payload, nil
+}
+
+// buildMultipartBody 构建与 GLM file_upload 接口兼容的 multipart/form-data 请求体
+func buildMultipartBody(boundary, filename, mimeType string, payload []byte) []byte {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "--%s\r\n", boundary)
+	fmt.Fprintf(&buf, "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n", filename)
+	fmt.Fprintf(&buf, "Content-Type: %s\r\n\r\n", mimeType)
+	buf.Write(payload)
+	fmt.Fprintf(&buf, "\r\n--%s--\r\n", boundary)
+	return buf.Bytes()
+}
+
+// extensionForMime 根据 MIME 类型推测文件扩展名，无法识别时返回 ".bin"
+func extensionForMime(mimeType string) string {
+	if exts, err := mime.ExtensionsByType(mimeType); err == nil && len(exts) > 0 {
+		return exts[0]
+	}
+	return ".bin"
+}
+
 // openChatStream 打开与 GLM 的流式聊天连接
 // 构建 GLM 格式的请求体，通过账号故障转移机制发送请求，返回 HTTP 响应流
 //
@@ -652,6 +861,15 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "OpenAI 原始 chat 请求 payload", openaiPayload)
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "转换后的 GLM messages", convertedMessages)
+
+	// 上传消息中引用的图片和文件附件，将上传后的引用前置到 GLM 消息 content 中
+	refs := c.uploadReferencedFiles(ctx, getMessagesList(openaiPayload))
+	if len(refs) > 0 {
+		if contentList, ok := convertedMessages[0]["content"].([]map[string]any); ok {
+			convertedMessages[0]["content"] = append(append([]map[string]any{}, refs...), contentList...)
+		}
+		logging.DebugDump(c.logger, c.config.DebugDumpAll, "附加上传引用后的 GLM messages", convertedMessages)
+	}
 
 	// 构建 GLM API 请求体
 	requestBody := map[string]any{
