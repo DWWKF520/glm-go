@@ -1,6 +1,6 @@
 module glm2api
 
-go 1.22
+go 1.24
 
 require (
 	github.com/RealAlexandreAI/json-repair v0.0.17
