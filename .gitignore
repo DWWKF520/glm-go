@@ -4,3 +4,5 @@ utils/
 *.log
 .vscode/
 .gomodcache/
+glm2api
+*.txt

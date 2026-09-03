@@ -286,7 +286,12 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 	refs := c.uploadReferencedFiles(ctx, getMessagesList(openaiPayload))
 	if len(refs) > 0 {
 		if contentList, ok := convertedMessages[0]["content"].([]map[string]any); ok {
-			convertedMessages[0]["content"] = append(append([]map[string]any{}, refs...), contentList...)
+			merged := make([]any, 0, len(refs)+len(contentList))
+			merged = append(merged, refs...)
+			for _, item := range contentList {
+				merged = append(merged, item)
+			}
+			convertedMessages[0]["content"] = merged
 		}
 		logging.DebugDump(c.logger, c.config.DebugDumpAll, "附加上传引用后的 GLM messages", convertedMessages)
 	}

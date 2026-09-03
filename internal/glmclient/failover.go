@@ -131,10 +131,42 @@ func (c *Client) resolveTools(openaiPayload map[string]any) []map[string]any {
 	return rawTools
 }
 
+// glmImageReference GLM chat 消息的图片引用 content 项（type=image）
+type glmImageReference struct {
+	Type  string                  `json:"type"`
+	Image []glmImageReferenceItem `json:"image"`
+}
+
+// glmImageReferenceItem 单张图片的引用信息
+type glmImageReferenceItem struct {
+	FileName string `json:"file_name"`
+	FileID   string `json:"file_id"`
+	ImageURL string `json:"image_url"`
+	FileSize int64  `json:"file_size"`
+	Order    int    `json:"order"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+}
+
+// glmFileReference GLM chat 消息的文件引用 content 项（type=file）
+type glmFileReference struct {
+	Type string                 `json:"type"`
+	File []glmFileReferenceItem `json:"file"`
+}
+
+// glmFileReferenceItem 单个文件的引用信息
+type glmFileReferenceItem struct {
+	FileName string `json:"file_name"`
+	FileID   string `json:"file_id"`
+	FileURL  string `json:"file_url"`
+	FileSize int64  `json:"file_size"`
+	Order    int    `json:"order"`
+}
+
 // uploadReferencedFiles 扫描 OpenAI 消息中引用的图片和文件附件并上传到 GLM
-// 返回可作为 GLM 消息 content 前缀的引用列表（image_url / file 结构）
-func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[string]any) []map[string]any {
-	var refs []map[string]any
+// 返回可作为 GLM 消息 content 前缀的引用列表（image / file 结构）
+func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[string]any) []any {
+	var refs []any
 	for _, message := range messages {
 		content, ok := message["content"].([]any)
 		if !ok {
@@ -160,7 +192,7 @@ func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[strin
 			if url == "" {
 				continue
 			}
-			ref := c.uploadFileReference(ctx, url, isImage)
+			ref := c.UploadFileReference(ctx, url, isImage)
 			if ref != nil {
 				refs = append(refs, ref)
 			}
@@ -184,7 +216,7 @@ func getContentItemURL(item map[string]any, key string) string {
 
 // uploadFileReference 下载文件并通过 GLM file_upload 接口上传，返回引用结构
 // 上传失败时记录警告并返回 nil（不阻断聊天请求）
-func (c *Client) uploadFileReference(ctx context.Context, fileURL string, isImage bool) map[string]any {
+func (c *Client) UploadFileReference(ctx context.Context, fileURL string, isImage bool) any {
 	filename, mimeType, payload, err := c.fetchFilePayload(ctx, fileURL)
 	if err != nil {
 		c.logger.Warn("上传附件失败", "url", fileURL, "error", err)
@@ -235,22 +267,30 @@ func (c *Client) uploadFileReference(ctx context.Context, fileURL string, isImag
 	}
 	result, _ := resultPayload["result"].(map[string]any)
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "GLM 文件上传响应 result", result)
-	sourceID, _ := result["source_id"].(string)
+	fileID, _ := result["file_id"].(string)
 	fileResultURL, _ := result["file_url"].(string)
-	if fileResultURL == "" {
-		fileResultURL = fileURL
-	}
-	if sourceID == "" {
-		return nil
-	}
+	fileName, _ := result["file_name"].(string)
+	fileSize, _ := result["file_size"].(float64)
 	if isImage {
-		url := fileResultURL
-		if url == "" {
-			url = sourceID
+		return glmImageReference{
+			Type: "image",
+			Image: []glmImageReferenceItem{{
+				FileName: fileName,
+				FileID:   fileID,
+				ImageURL: fileResultURL,
+				FileSize: int64(fileSize),
+			}},
 		}
-		return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}
 	}
-	return map[string]any{"type": "file", "file": []map[string]any{{"source_id": sourceID, "file_url": fileResultURL}}}
+	return glmFileReference{
+		Type: "file",
+		File: []glmFileReferenceItem{{
+			FileName: fileName,
+			FileID:   fileID,
+			FileURL:  fileResultURL,
+			FileSize: int64(fileSize),
+		}},
+	}
 }
 
 // fetchFilePayload 获取待上传文件的内容

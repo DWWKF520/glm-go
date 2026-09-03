@@ -14,34 +14,10 @@ import urllib.request
 
 API = "http://127.0.0.1:8000/v1/chat/completions"
 
-
-def make_test_image(path: str) -> str:
-    """生成蓝色方块测试图，返回文件路径。"""
-    try:
-        from PIL import Image
-
-        Image.new("RGB", (150, 150), (30, 60, 220)).save(path)
-    except ImportError:
-        # 固定的 1x1 蓝色 PNG 兜底
-        data = base64.b64decode(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
-            "AAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-        )
-        with open(path, "wb") as f:
-            f.write(data)
-    return path
-
-
-if len(sys.argv) > 1:
-    image_path = sys.argv[1]
-else:
-    image_path = make_test_image("/tmp/upload_test/blue_square.png")
-
-# 图片转 base64 data URL
-with open(image_path, "rb") as f:
-    img_b64 = base64.b64encode(f.read()).decode("ascii")
-data_url = f"data:image/png;base64,{img_b64}"
-print(f"图片: {image_path} ({os.path.getsize(image_path)} bytes, base64 {len(img_b64)} 字符)")
+image = "/home/wkf/下载/R-C.jpeg"
+base64_img = base64.b64encode(open(image, "rb").read()).decode("ascii")
+data_url = f"data:image/jpeg;base64,{base64_img}"
+print(f"图片: {image} ({os.path.getsize(image)} bytes, base64 {len(base64_img)} 字符)")
 
 payload = {
     "model": "glm-5.3",
@@ -50,7 +26,7 @@ payload = {
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "这张图片是什么颜色？只回答颜色，不要猜。"},
+                {"type": "text", "text": "这张图片是什么"},
                 {"type": "image_url", "image_url": {"url": data_url}},
             ],
         }

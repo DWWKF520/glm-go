@@ -56,6 +56,7 @@ func (s *Server) setupRouter() {
 	{
 		v1.POST("/chat/completions", s.handleChatCompletions)
 		v1.POST("/images/generations", s.handleImagesGenerations)
+		v1.POST("/files/references", s.handleFilesReferences)
 	}
 
 	s.router = r
@@ -300,4 +301,25 @@ func (s *Server) writeError(c *gin.Context, err error) {
 		}
 	}
 	c.JSON(status, payload)
+}
+
+type UploadFileReferenceRequest struct {
+	FilePath string `json:"file_path"`
+	IsImage  bool   `json:"is_image"`
+}
+
+func (s *Server) handleFilesReferences(c *gin.Context) {
+	var req UploadFileReferenceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{
+				"message": "请求体解析失败: " + err.Error(),
+				"type":    "invalid_request_error",
+			},
+		})
+		return
+	}
+	ctx := c.Request.Context()
+	response := s.client.UploadFileReference(ctx, req.FilePath, req.IsImage)
+	c.JSON(http.StatusOK, response)
 }
