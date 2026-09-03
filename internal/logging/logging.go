@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bytedance/sonic"
 )
 
 var (
@@ -104,7 +106,11 @@ func SerializeForDebug(value any) string {
 		}
 		return v
 	default:
-		s := fmt.Sprintf("%v", v)
+		// 结构体、切片等复杂类型优先以 JSON 输出（类型化重构后 DebugDump 的可读性依赖此处）
+		s, err := sonic.MarshalString(v)
+		if err != nil {
+			s = fmt.Sprintf("%v", v)
+		}
 		if len(s) > 2000 {
 			return s[:2000] + fmt.Sprintf("... [%d chars total]", len(s))
 		}

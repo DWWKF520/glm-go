@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/bytedance/sonic"
@@ -19,6 +18,8 @@ import (
 
 	"glm2api/internal/auth"
 	"glm2api/internal/logging"
+	"glm2api/internal/openai"
+	"glm2api/internal/translator"
 )
 
 // operationFunc 账号操作函数类型
@@ -118,74 +119,26 @@ func (c *Client) getPreferredAccountIndex(ticket int) *int {
 	return &idx
 }
 
-// resolveTools 从 OpenAI 请求 payload 中提取工具定义列表
-func (c *Client) resolveTools(openaiPayload map[string]any) []map[string]any {
-	var rawTools []map[string]any
-	if t, ok := openaiPayload["tools"].([]any); ok {
-		for _, item := range t {
-			if m, ok := item.(map[string]any); ok {
-				rawTools = append(rawTools, m)
-			}
-		}
-	}
-	return rawTools
-}
-
-// glmImageReference GLM chat 消息的图片引用 content 项（type=image）
-type glmImageReference struct {
-	Type  string                  `json:"type"`
-	Image []glmImageReferenceItem `json:"image"`
-}
-
-// glmImageReferenceItem 单张图片的引用信息
-type glmImageReferenceItem struct {
-	FileName string `json:"file_name"`
-	FileID   string `json:"file_id"`
-	ImageURL string `json:"image_url"`
-	FileSize int64  `json:"file_size"`
-	Order    int    `json:"order"`
-	Width    int    `json:"width"`
-	Height   int    `json:"height"`
-}
-
-// glmFileReference GLM chat 消息的文件引用 content 项（type=file）
-type glmFileReference struct {
-	Type string                 `json:"type"`
-	File []glmFileReferenceItem `json:"file"`
-}
-
-// glmFileReferenceItem 单个文件的引用信息
-type glmFileReferenceItem struct {
-	FileName string `json:"file_name"`
-	FileID   string `json:"file_id"`
-	FileURL  string `json:"file_url"`
-	FileSize int64  `json:"file_size"`
-	Order    int    `json:"order"`
-}
-
 // uploadReferencedFiles 扫描 OpenAI 消息中引用的图片和文件附件并上传到 GLM
-// 返回可作为 GLM 消息 content 前缀的引用列表（image / file 结构）
-func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[string]any) []any {
-	var refs []any
+// 返回可作为 GLM 消息 content 前缀的引用列表（image / file content part）
+func (c *Client) uploadReferencedFiles(ctx context.Context, messages []openai.Message) []translator.GLMContentPart {
+	var refs []translator.GLMContentPart
 	for _, message := range messages {
-		content, ok := message["content"].([]any)
-		if !ok {
-			continue
-		}
-		for _, rawItem := range content {
-			item, ok := rawItem.(map[string]any)
-			if !ok {
-				continue
-			}
-			itemType, _ := item["type"].(string)
+		for _, part := range message.Content.Parts() {
 			var url string
 			isImage := false
-			switch itemType {
+			switch part.Type {
 			case "image_url":
-				url = getContentItemURL(item, "image_url")
+				if part.ImageURL == nil {
+					continue
+				}
+				url = part.ImageURL.URL
 				isImage = true
 			case "file":
-				url = getContentItemURL(item, "file_url")
+				if part.FileURL == nil {
+					continue
+				}
+				url = part.FileURL.URL
 			default:
 				continue
 			}
@@ -194,7 +147,7 @@ func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[strin
 			}
 			ref := c.UploadFileReference(ctx, url, isImage)
 			if ref != nil {
-				refs = append(refs, ref)
+				refs = append(refs, *ref)
 			}
 		}
 	}
@@ -204,19 +157,9 @@ func (c *Client) uploadReferencedFiles(ctx context.Context, messages []map[strin
 	return refs
 }
 
-// getContentItemURL 从 content item 的嵌套对象中提取 url 字段（如 image_url.url / file_url.url）
-func getContentItemURL(item map[string]any, key string) string {
-	obj, ok := item[key].(map[string]any)
-	if !ok {
-		return ""
-	}
-	url, _ := obj["url"].(string)
-	return url
-}
-
 // uploadFileReference 下载文件并通过 GLM file_upload 接口上传，返回引用结构
 // 上传失败时记录警告并返回 nil（不阻断聊天请求）
-func (c *Client) UploadFileReference(ctx context.Context, fileURL string, isImage bool) any {
+func (c *Client) UploadFileReference(ctx context.Context, fileURL string, isImage bool) *translator.GLMContentPart {
 	filename, mimeType, payload, err := c.fetchFilePayload(ctx, fileURL)
 	if err != nil {
 		c.logger.Warn("上传附件失败", "url", fileURL, "error", err)
@@ -272,9 +215,9 @@ func (c *Client) UploadFileReference(ctx context.Context, fileURL string, isImag
 	fileName, _ := result["file_name"].(string)
 	fileSize, _ := result["file_size"].(float64)
 	if isImage {
-		return glmImageReference{
+		return &translator.GLMContentPart{
 			Type: "image",
-			Image: []glmImageReferenceItem{{
+			Image: []translator.GLMImageRef{{
 				FileName: fileName,
 				FileID:   fileID,
 				ImageURL: fileResultURL,
@@ -282,9 +225,9 @@ func (c *Client) UploadFileReference(ctx context.Context, fileURL string, isImag
 			}},
 		}
 	}
-	return glmFileReference{
+	return &translator.GLMContentPart{
 		Type: "file",
-		File: []glmFileReferenceItem{{
+		File: []translator.GLMFileRef{{
 			FileName: fileName,
 			FileID:   fileID,
 			FileURL:  fileResultURL,
@@ -560,30 +503,6 @@ func (c *Client) buildErrorMessage(statusCode int, payload map[string]any) strin
 
 // --- 辅助函数 ---
 
-// getMessagesList 从 OpenAI payload 中提取 messages 列表
-// payload["messages"] 是 []any 类型，需要转换为 []map[string]any
-func getMessagesList(payload map[string]any) []map[string]any {
-	messages, ok := payload["messages"].([]any)
-	if !ok {
-		return nil
-	}
-	var result []map[string]any
-	for _, m := range messages {
-		if mm, ok := m.(map[string]any); ok {
-			result = append(result, mm)
-		}
-	}
-	return result
-}
-
-// getModelName 从 payload 中获取模型名称，若为空则返回默认名称
-func getModelName(payload map[string]any, defaultName string) string {
-	if m, ok := payload["model"].(string); ok && strings.TrimSpace(m) != "" {
-		return m
-	}
-	return defaultName
-}
-
 // getAny 安全地从 map 中获取指定 key 的值，key 不存在时返回 nil
 func getAny(m map[string]any, key string) any {
 	if m == nil {
@@ -595,33 +514,3 @@ func getAny(m map[string]any, key string) any {
 	}
 	return v
 }
-
-// coercePositiveInt 将任意类型的安全转换为正整数
-// 支持 float64 和 int 类型，其他类型返回 defaultValue
-// 结果会被限制在 [1, maximum] 范围内
-func coercePositiveInt(value any, defaultValue, maximum int) int {
-	switch v := value.(type) {
-	case float64:
-		n := int(v)
-		if n < 1 {
-			n = defaultValue
-		}
-		if n > maximum {
-			n = maximum
-		}
-		return n
-	case int:
-		if v < 1 {
-			return defaultValue
-		}
-		if v > maximum {
-			return maximum
-		}
-		return v
-	default:
-		return defaultValue
-	}
-}
-
-// 用于消除未使用导入的告警
-var _ = sort.Strings

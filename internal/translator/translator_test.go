@@ -6,36 +6,37 @@ import (
 
 	"github.com/bytedance/sonic"
 
+	"glm2api/internal/openai"
 	"glm2api/internal/tools"
 )
 
-// TestExtractTextContentFiltersEmpty 验证空文本片段被过滤（与 Python join(if part) 一致）
-func TestExtractTextContentFiltersEmpty(t *testing.T) {
+// TestContentTextFiltersEmpty 验证 Content.Text() 过滤空文本片段（与 Python join(if part) 一致）
+func TestContentTextFiltersEmpty(t *testing.T) {
 	// 含空 text 片段 → 不应产生多余换行
-	content := []any{
-		map[string]any{"type": "text", "text": "hello"},
-		map[string]any{"type": "text", "text": ""}, // 空
-		map[string]any{"type": "text", "text": "world"},
-	}
-	got := ExtractTextContent(content)
+	content := openai.PartsContent(
+		openai.ContentPart{Type: "text", Text: "hello"},
+		openai.ContentPart{Type: "text", Text: ""}, // 空
+		openai.ContentPart{Type: "text", Text: "world"},
+	)
+	got := content.Text()
 	want := "hello\nworld"
 	if got != want {
 		t.Errorf("empty filter: got %q, want %q", got, want)
 	}
 
 	// 缺少 text 字段 → 不输出 <nil>
-	content = []any{
-		map[string]any{"type": "text"}, // 无 text 字段
-		map[string]any{"type": "text", "text": "ok"},
-	}
-	got = ExtractTextContent(content)
+	content = openai.PartsContent(
+		openai.ContentPart{Type: "text"}, // 无 text 字段
+		openai.ContentPart{Type: "text", Text: "ok"},
+	)
+	got = content.Text()
 	want = "ok"
 	if got != want {
 		t.Errorf("missing text field: got %q, want %q", got, want)
 	}
 
 	// 字符串内容直接返回
-	if got := ExtractTextContent("plain text"); got != "plain text" {
+	if got := openai.StringContent("plain text").Text(); got != "plain text" {
 		t.Errorf("string content: got %q", got)
 	}
 }
@@ -309,18 +310,15 @@ func TestConsumeEventServerSideToolCallWithEmbeddedArgs(t *testing.T) {
 	}
 
 	tc := acc.serverSideToolCalls[0]
-	fn, _ := tc["function"].(map[string]any)
-	name, _ := fn["name"].(string)
-	args, _ := fn["arguments"].(string)
 
-	if name != "Read" {
-		t.Errorf("tool name = %q, want %q", name, "Read")
+	if tc.Name != "Read" {
+		t.Errorf("tool name = %q, want %q", tc.Name, "Read")
 	}
-	if !strings.Contains(args, "file_path") {
-		t.Errorf("expected args to contain file_path, got %q", args)
+	if !strings.Contains(tc.Arguments, "file_path") {
+		t.Errorf("expected args to contain file_path, got %q", tc.Arguments)
 	}
-	if !strings.Contains(args, "e:\\\\test.txt") {
-		t.Errorf("expected args to contain the file path, got %q", args)
+	if !strings.Contains(tc.Arguments, "e:\\\\test.txt") {
+		t.Errorf("expected args to contain the file path, got %q", tc.Arguments)
 	}
 }
 
@@ -358,15 +356,13 @@ func TestConsumeEventServerSideToolCallPrefersExplicitArguments(t *testing.T) {
 	}
 
 	tc := acc.serverSideToolCalls[0]
-	fn, _ := tc["function"].(map[string]any)
-	args, _ := fn["arguments"].(string)
 
 	// 应使用 explicit.txt 而非 embedded.txt
-	if !strings.Contains(args, "explicit.txt") {
-		t.Errorf("expected args to prefer explicit arguments, got %q", args)
+	if !strings.Contains(tc.Arguments, "explicit.txt") {
+		t.Errorf("expected args to prefer explicit arguments, got %q", tc.Arguments)
 	}
-	if strings.Contains(args, "embedded.txt") {
-		t.Errorf("should not use embedded args when explicit arguments provided, got %q", args)
+	if strings.Contains(tc.Arguments, "embedded.txt") {
+		t.Errorf("should not use embedded args when explicit arguments provided, got %q", tc.Arguments)
 	}
 }
 
@@ -405,17 +401,15 @@ func TestConsumeEventServerSideToolCallTruncatedArgs(t *testing.T) {
 	}
 
 	tc := acc.serverSideToolCalls[0]
-	fn, _ := tc["function"].(map[string]any)
-	args, _ := fn["arguments"].(string)
 
 	// 修复后必须是完整可解析的 JSON
 	var parsed map[string]any
-	if err := sonic.UnmarshalString(args, &parsed); err != nil {
-		t.Fatalf("repaired args should be valid JSON, got %q: %v", args, err)
+	if err := sonic.UnmarshalString(tc.Arguments, &parsed); err != nil {
+		t.Fatalf("repaired args should be valid JSON, got %q: %v", tc.Arguments, err)
 	}
 	// 启发式矫正应将字符串 "5" 转为数字 5（JSON 反序列化后为 float64）
 	if num, ok := parsed["num"].(float64); !ok || num != 5 {
-		t.Errorf("num = %v (%T), want number 5; args=%q", parsed["num"], parsed["num"], args)
+		t.Errorf("num = %v (%T), want number 5; args=%q", parsed["num"], parsed["num"], tc.Arguments)
 	}
 	if q, _ := parsed["query"].(string); q != "灵巧手 仿生手 机器人技术 发展趋势" {
 		t.Errorf("query = %q", q)
@@ -756,7 +750,7 @@ func TestConsumeEventIncrementalPushToolCall(t *testing.T) {
 	}
 }
 
-// TestAnnotateNoInternet 验证用户消息中的链接会被追加 "（你没有联网）" 标注，文件路径不标注
+// TestAnnotateNoInternet 验证用户消息中的链接会被追加 "（你未联网，要使用search相关工具）" 标注，文件路径不标注
 func TestAnnotateNoInternet(t *testing.T) {
 	cases := []struct {
 		name, in, want string
@@ -764,7 +758,7 @@ func TestAnnotateNoInternet(t *testing.T) {
 		{
 			name: "http URL",
 			in:   "请看这个链接 https://example.com/docs 谢谢",
-			want: "请看这个链接 https://example.com/docs（你没有联网） 谢谢",
+			want: "请看这个链接 https://example.com/docs（你未联网，要使用search相关工具） 谢谢",
 		},
 		{
 			name: "Unix 路径不标注",
@@ -783,8 +777,8 @@ func TestAnnotateNoInternet(t *testing.T) {
 		},
 		{
 			name: "已标注的 URL 不重复追加（幂等）",
-			in:   "看 https://example.com/a（你没有联网） 这个",
-			want: "看 https://example.com/a（你没有联网） 这个",
+			in:   "看 https://example.com/a（你未联网，要使用search相关工具） 这个",
+			want: "看 https://example.com/a（你未联网，要使用search相关工具） 这个",
 		},
 	}
 	for _, c := range cases {
@@ -794,16 +788,16 @@ func TestAnnotateNoInternet(t *testing.T) {
 	}
 }
 
-// TestStripNoInternetNote 验证出站时清除工具参数中的 "（你没有联网）" 标注
+// TestStripNoInternetNote 验证出站时清除工具参数中的 "（你未联网，要使用search相关工具）" 标注
 func TestStripNoInternetNote(t *testing.T) {
 	cases := []struct {
 		name, in, want string
 	}{
-		{name: "全角括号", in: "https://example.com（你没有联网）", want: "https://example.com"},
-		{name: "半角括号", in: "https://example.com (你没有联网)", want: "https://example.com"},
-		{name: "路径中间", in: "/home/wkf/a.txt（你没有联网）", want: "/home/wkf/a.txt"},
+		{name: "全角括号", in: "https://example.com（你未联网，要使用search相关工具）", want: "https://example.com"},
+		{name: "半角括号", in: "https://example.com (你未联网，要使用search相关工具)", want: "https://example.com"},
+		{name: "路径中间", in: "/home/wkf/a.txt（你未联网，要使用search相关工具）", want: "/home/wkf/a.txt"},
 		{name: "无标注", in: "https://example.com", want: "https://example.com"},
-		{name: "纯标注", in: "（你没有联网）", want: ""},
+		{name: "纯标注", in: "（你未联网，要使用search相关工具）", want: ""},
 	}
 	for _, c := range cases {
 		if got := StripNoInternetNote(c.in); got != c.want {
@@ -815,19 +809,18 @@ func TestStripNoInternetNote(t *testing.T) {
 // TestConvertMessagesAnnotatesUserURL 验证 ConvertMessages 对用户消息中的 URL 追加标注，
 // 且 fallback URL 不被标注污染
 func TestConvertMessagesAnnotatesUserURL(t *testing.T) {
-	messages := []map[string]any{
-		{"role": "user", "content": "总结 https://example.com/article 的内容"},
+	messages := []openai.Message{
+		{Role: "user", Content: openai.StringContent("总结 https://example.com/article 的内容")},
 	}
 	result := ConvertMessages(messages, nil, nil)
 	if len(result) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(result))
 	}
-	content, _ := result[0]["content"].([]map[string]any)
-	if len(content) == 0 {
+	if len(result[0].Content) == 0 {
 		t.Fatal("expected content list")
 	}
-	text, _ := content[0]["text"].(string)
-	want := "https://example.com/article（你没有联网）"
+	text := result[0].Content[0].Text
+	want := "https://example.com/article（你未联网，要使用search相关工具）"
 	if !strings.Contains(text, want) {
 		t.Errorf("prompt missing annotation %q, got %q", want, text)
 	}
@@ -835,7 +828,7 @@ func TestConvertMessagesAnnotatesUserURL(t *testing.T) {
 
 // TestSanitizeToolCallPayloadStripsNote 验证工具调用参数中的标注被清除
 func TestSanitizeToolCallPayloadStripsNote(t *testing.T) {
-	arguments := `{"url":"https://example.com/data（你没有联网）"}`
+	arguments := `{"url":"https://example.com/data（你未联网，要使用search相关工具）"}`
 	paramTypes := map[string]string{"url": "string"}
 	cleaned := SanitizeToolCallPayload("read", arguments, "", paramTypes)
 	if cleaned == nil {
@@ -861,7 +854,7 @@ func TestConsumeEventServerSideToolCallStripsNote(t *testing.T) {
 							"id":   "tool-1",
 							"name": "read",
 							"arguments": map[string]any{
-								"url": "https://example.com/page（你没有联网）",
+								"url": "https://example.com/page（你未联网，要使用search相关工具）",
 							},
 						},
 					},
@@ -874,13 +867,12 @@ func TestConsumeEventServerSideToolCallStripsNote(t *testing.T) {
 	if len(acc.serverSideToolCalls) != 1 {
 		t.Fatalf("expected 1 server-side tool call, got %d", len(acc.serverSideToolCalls))
 	}
-	fn, _ := acc.serverSideToolCalls[0]["function"].(map[string]any)
-	args, _ := fn["arguments"].(string)
+	args := acc.serverSideToolCalls[0].Arguments
 	want := `"url":"https://example.com/page"`
 	if !strings.Contains(args, want) {
 		t.Errorf("args = %q, want to contain %q", args, want)
 	}
-	if strings.Contains(args, "你没有联网") {
+	if strings.Contains(args, "search相关工具") {
 		t.Errorf("args still contains the note: %q", args)
 	}
 }
