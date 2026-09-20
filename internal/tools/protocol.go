@@ -1,12 +1,15 @@
 package tools
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/bytedance/sonic"
+
+	"glm2api/internal/openai"
 )
 
 // ServerSideToolNames 存储服务端工具名称的集合（目前为空集合）。
@@ -311,9 +314,12 @@ const (
 // toolName 用于参数名启发式的上下文判断（如 pattern 对 Glob 是通配符、对 Grep 是正则）。
 // required 参数按声明顺序全部包含，其余可选参数按字母序采样（上限 maxSampleProps），
 // 保证同一 schema 生成结果稳定。无 properties 时返回空 map。
-func SampleArgumentsFromSchema(toolName string, parameters any) map[string]any {
-	m, ok := parameters.(map[string]any)
-	if !ok {
+func SampleArgumentsFromSchema(toolName string, parameters json.RawMessage) map[string]any {
+	if len(parameters) == 0 {
+		return map[string]any{}
+	}
+	var m map[string]any
+	if err := sonic.Unmarshal(parameters, &m); err != nil || m == nil {
 		return map[string]any{}
 	}
 	props, _ := m["properties"].(map[string]any)
@@ -465,31 +471,26 @@ func requiredList(schema map[string]any) []string {
 // 与通用协议指令 tx 拼接为完整的提示词。
 // serverSideToolNames 指定服务端工具集合。
 // 返回过滤掉空段落后的完整提示词文本。
-func ToolsToPrompt(tools []map[string]any, serverSideToolNames map[string]bool) string {
+func ToolsToPrompt(tools []openai.Tool, serverSideToolNames map[string]bool) string {
 	var toolNames []string
 	var toolSchemas []string
 	for _, tool := range tools {
-		fn, _ := tool["function"].(map[string]any)
-		if fn == nil {
-			continue
-		}
-		name := fmt.Sprintf("%v", fn["name"])
-		if name == "" || name == "<nil>" {
+		fn := tool.Function
+		name := strings.TrimSpace(fn.Name)
+		if name == "" {
 			name = "unknown"
 		}
-		description := ""
-		if d, ok := fn["description"].(string); ok {
-			description = d
-		}
-		parameters := fn["parameters"]
 		toolNames = append(toolNames, name)
 		paramsJSON := "{}"
-		if p, ok := parameters.(map[string]any); ok {
-			paramsJSON = SafeJSONDumpsCompact(p)
+		if len(fn.Parameters) > 0 {
+			var p map[string]any
+			if err := sonic.Unmarshal(fn.Parameters, &p); err == nil && p != nil {
+				paramsJSON = SafeJSONDumpsCompact(p)
+			}
 		}
-		schemaSection := "### " + name + "\n" + description + "\nParameters: " + paramsJSON
+		schemaSection := "### " + name + "\n" + fn.Description + "\nParameters: " + paramsJSON
 		// 从参数 schema 自动生成示例调用，内嵌到该工具段落中
-		if sampleArgs := SampleArgumentsFromSchema(name, parameters); len(sampleArgs) > 0 {
+		if sampleArgs := SampleArgumentsFromSchema(name, fn.Parameters); len(sampleArgs) > 0 {
 			schemaSection += "\nExample:\n" + SerializeToolCallBlock(name, sampleArgs)
 		}
 		toolSchemas = append(toolSchemas, schemaSection)

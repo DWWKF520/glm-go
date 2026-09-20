@@ -30,8 +30,45 @@ import (
 	"github.com/bytedance/sonic"
 
 	"glm2api/internal/logging"
+	"glm2api/internal/openai"
 	"glm2api/internal/tools"
 )
+
+// --- GLM 请求 wire 类型 ---
+
+// GLMMessage GLM Web API 聊天请求的消息结构
+type GLMMessage struct {
+	Role    string           `json:"role"`
+	Content []GLMContentPart `json:"content"`
+}
+
+// GLMContentPart GLM 消息内容分块：type 为 text / image / file
+type GLMContentPart struct {
+	Type  string        `json:"type"`
+	Text  string        `json:"text,omitempty"`
+	Image []GLMImageRef `json:"image,omitempty"`
+	File  []GLMFileRef  `json:"file,omitempty"`
+}
+
+// GLMImageRef GLM 消息中的图片引用信息
+type GLMImageRef struct {
+	FileName string `json:"file_name"`
+	FileID   string `json:"file_id"`
+	ImageURL string `json:"image_url"`
+	FileSize int64  `json:"file_size"`
+	Order    int    `json:"order"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+}
+
+// GLMFileRef GLM 消息中的文件引用信息
+type GLMFileRef struct {
+	FileName string `json:"file_name"`
+	FileID   string `json:"file_id"`
+	FileURL  string `json:"file_url"`
+	FileSize int64  `json:"file_size"`
+	Order    int    `json:"order"`
+}
 
 // --- 正则表达式和常量 ---
 // tx 是发送给 GLM 的通用工具调用协议指令。
@@ -124,33 +161,6 @@ func stripNoInternetNoteArgs(args map[string]any) {
 	}
 }
 
-func ExtractTextContent(content any) string {
-	switch v := content.(type) {
-	case string:
-		return v
-	case map[string]any:
-		return tools.SafeJSONDumpsCompact(v)
-	case []any:
-		var parts []string
-		for _, item := range v {
-			m, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			itemType, _ := m["type"].(string)
-			switch itemType {
-			case "text":
-				if t, ok := m["text"]; ok && t != nil {
-					parts = append(parts, fmt.Sprintf("%v", t))
-				}
-			}
-		}
-		return strings.Join(filterEmpty(parts), "\n")
-	default:
-		return ""
-	}
-}
-
 // ExtractFirstURL 从文本中提取第一个 URL
 // 自动去除 URL 尾部常见的标点符号（如句号、逗号、括号等）
 func ExtractFirstURL(text string) string {
@@ -165,14 +175,13 @@ func ExtractFirstURL(text string) string {
 // ExtractRecentUserURL 从消息列表中提取最近一条用户消息中的 URL
 // 从后往前遍历消息列表，找到第一个包含 URL 的用户消息并返回该 URL
 // 用于工具调用的 fallbackURL 参数（当模型未能正确填充 URL 参数时使用）
-func ExtractRecentUserURL(messages []map[string]any) string {
+func ExtractRecentUserURL(messages []openai.Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		msg := messages[i]
-		role, _ := msg["role"].(string)
-		if strings.TrimSpace(role) != "user" {
+		if strings.TrimSpace(msg.Role) != "user" {
 			continue
 		}
-		text := ExtractTextContent(msg["content"])
+		text := msg.Content.Text()
 		url := ExtractFirstURL(text)
 		if url != "" {
 			return url
@@ -200,22 +209,21 @@ func ExtractRecentUserURL(messages []map[string]any) string {
 //	}
 //
 // 返回格式：map[工具名]map[参数名]参数类型字符串
-func buildToolParamTypeMap(toolsList []map[string]any) map[string]map[string]string {
+func buildToolParamTypeMap(toolsList []openai.Tool) map[string]map[string]string {
 	result := make(map[string]map[string]string)
 	if len(toolsList) == 0 {
 		return result
 	}
 	for _, tool := range toolsList {
-		fn, _ := tool["function"].(map[string]any)
-		if fn == nil {
-			continue
-		}
-		toolName := strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
+		toolName := strings.TrimSpace(tool.Function.Name)
 		if toolName == "" {
 			continue
 		}
-		parameters, _ := fn["parameters"].(map[string]any)
-		if parameters == nil {
+		if len(tool.Function.Parameters) == 0 {
+			continue
+		}
+		var parameters map[string]any
+		if err := sonic.Unmarshal(tool.Function.Parameters, &parameters); err != nil || parameters == nil {
 			continue
 		}
 		properties, _ := parameters["properties"].(map[string]any)
@@ -239,18 +247,14 @@ func buildToolParamTypeMap(toolsList []map[string]any) map[string]map[string]str
 
 // extractToolNames 从工具定义列表中提取所有工具名称，用于辅助从 name 字段中分离嵌入的工具名和参数名。
 // 返回工具名称字符串切片；输入为空返回 nil。
-func extractToolNames(toolsList []map[string]any) []string {
+func extractToolNames(toolsList []openai.Tool) []string {
 	if len(toolsList) == 0 {
 		return nil
 	}
 	names := make([]string, 0, len(toolsList))
 	for _, tool := range toolsList {
-		fn, _ := tool["function"].(map[string]any)
-		if fn == nil {
-			continue
-		}
-		name := strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
-		if name != "" && name != "<nil>" {
+		name := strings.TrimSpace(tool.Function.Name)
+		if name != "" {
 			names = append(names, name)
 		}
 	}
@@ -501,71 +505,99 @@ func SanitizeToolCallPayload(toolName string, arguments any, fallbackURL string,
 	return cleaned
 }
 
-// SanitizeToolCalls 批量清理工具调用列表
-//
-// 对每个工具调用：
-//  1. 提取并验证工具名称（空名称的调用被跳过）
-//  2. 调用 SanitizeToolCallPayload 清理参数
-//  3. 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）
-//  4. 检测参数是否被修复（_repaired 标记）
-//  5. 生成标准格式的工具调用对象
-//
-// 参数：
-//   - toolCalls: 原始工具调用列表
-//   - fallbackURL: 备用 URL（用于修复参数格式错误）
-//   - toolsList: 工具定义列表（用于提取参数类型信息进行类型矫正）
-//
-// 返回清理后的工具调用列表
-func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string, toolsList []map[string]any) []map[string]any {
-	// 构建工具名称到参数类型映射
-	toolParamTypes := buildToolParamTypeMap(toolsList)
+// SanitizedToolCall 清理后的工具调用：OpenAI tool_call 格式，
+// 附加流式增量所需的 index 与内部修复标记。
+type SanitizedToolCall struct {
+	Index     int    `json:"index"`
+	ID        string `json:"id"`
+	Type      string `json:"type"` // 固定 "function"
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"` // 紧凑 JSON 字符串
+	Repaired  bool   `json:"-"`         // 参数是否被修复（内部标记，不序列化）
+}
 
-	var sanitized []map[string]any
-	for i, tc := range toolCalls {
+// toolCallsFromRaw 将工具解析器输出的动态 map（GLM 文本解析产物）转换为类型化 ToolCall。
+// 非法条目（缺 function/name）被跳过。
+func toolCallsFromRaw(raw []map[string]any) []openai.ToolCall {
+	if len(raw) == 0 {
+		return nil
+	}
+	result := make([]openai.ToolCall, 0, len(raw))
+	for _, tc := range raw {
 		fn, _ := tc["function"].(map[string]any)
 		if fn == nil {
 			continue
 		}
-		toolName := strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
+		name, _ := fn["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		id, _ := tc["id"].(string)
+		args, _ := fn["arguments"].(string)
+		result = append(result, openai.ToolCall{
+			ID:   id,
+			Type: "function",
+			Function: openai.ToolCallFunction{
+				Name:      name,
+				Arguments: args,
+			},
+		})
+	}
+	return result
+}
+
+// SanitizeToolCalls 批量清理工具调用列表
+//
+// 对每个工具调用：
+//  1. 验证工具名称（空名称的调用被跳过）
+//  2. 调用 SanitizeToolCallPayload 清理参数
+//  3. 根据工具 schema 矫正参数类型（如字符串 "5" → 数字 5）
+//  4. 检测参数是否被修复（Repaired 标记）
+//  5. 生成标准格式的类型化工具调用
+//
+// 参数：
+//   - toolCalls: 原始工具调用列表（OpenAI 格式）
+//   - fallbackURL: 备用 URL（用于修复参数格式错误）
+//   - toolsList: OpenAI 格式的工具定义列表（用于提取参数类型信息进行类型矫正）
+//
+// 返回清理后的类型化工具调用列表
+func SanitizeToolCalls(toolCalls []openai.ToolCall, fallbackURL string, toolsList []openai.Tool) []SanitizedToolCall {
+	// 构建工具名称到参数类型映射
+	toolParamTypes := buildToolParamTypeMap(toolsList)
+
+	var sanitized []SanitizedToolCall
+	for i, tc := range toolCalls {
+		toolName := strings.TrimSpace(tc.Function.Name)
 		if toolName == "" {
 			continue
 		}
-		originalArguments := fn["arguments"]
-		originalValue := originalArguments
-		if s, ok := originalArguments.(string); ok {
-			var v any
-			if err := sonic.UnmarshalString(s, &v); err == nil {
-				originalValue = v
-			} else {
-				originalValue = s
-			}
-		}
 		// 获取该工具的参数类型映射
 		paramTypes := toolParamTypes[toolName]
-		cleanedArguments := SanitizeToolCallPayload(toolName, originalArguments, fallbackURL, paramTypes)
+		cleanedArguments := SanitizeToolCallPayload(toolName, tc.Function.Arguments, fallbackURL, paramTypes)
 		if cleanedArguments == nil {
 			continue
 		}
 
 		// 比较清理前后的 JSON 表示，判断参数是否被修复
-		repaired := true
-		if _, isDict := originalValue.(map[string]any); isDict {
-			repaired = tools.SafeJSONDumpsCompact(cleanedArguments) != tools.SafeJSONDumpsCompact(originalValue)
+		repaired := false
+		var originalValue any
+		if err := sonic.UnmarshalString(tc.Function.Arguments, &originalValue); err == nil {
+			if _, isDict := originalValue.(map[string]any); isDict {
+				repaired = tools.SafeJSONDumpsCompact(cleanedArguments) != tools.SafeJSONDumpsCompact(originalValue)
+			}
 		}
 
-		id, _ := tc["id"].(string)
+		id := strings.TrimSpace(tc.ID)
 		if id == "" {
 			id = fmt.Sprintf("call_repaired_%d", i)
 		}
-		sanitized = append(sanitized, map[string]any{
-			"id":        id,
-			"type":      "function",
-			"index":     i,
-			"_repaired": repaired,
-			"function": map[string]any{
-				"name":      toolName,
-				"arguments": tools.SafeJSONDumpsCompact(cleanedArguments),
-			},
+		sanitized = append(sanitized, SanitizedToolCall{
+			Index:     i,
+			ID:        id,
+			Type:      "function",
+			Name:      toolName,
+			Arguments: tools.SafeJSONDumpsCompact(cleanedArguments),
+			Repaired:  repaired,
 		})
 	}
 	return sanitized
@@ -577,7 +609,7 @@ func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string, toolsList
 // 纯文本提示词，其中包含工具定义、对话历史和角色标记。
 //
 // 转换流程：
-//  1. 构建可用工具名称集合，解析 tool_choice 策略
+//  1. 构建可用工具名称集合
 //  2. 遍历消息列表，逐条转换：
 //     - user 消息：提取文本，记录最新 URL
 //     - assistant 消息：将 tool_calls 转换为 [function_calls] 格式
@@ -588,23 +620,18 @@ func SanitizeToolCalls(toolCalls []map[string]any, fallbackURL string, toolsList
 // 参数：
 //   - messages: OpenAI 格式的消息列表
 //   - toolsList: OpenAI 格式的工具定义列表
-//   - toolChoice: tool_choice 参数（"auto"/"none"/"required" 或指定工具名）
 //   - serverSideToolNames: 服务端原生工具名集合（由后端自动执行）
 //
 // wkf
 func ConvertMessages(
-	messages []map[string]any,
-	toolsList []map[string]any,
+	messages []openai.Message,
+	toolsList []openai.Tool,
 	serverSideToolNames map[string]bool,
-) []map[string]any {
+) []GLMMessage {
 	// 构建可用工具名称集合
 	availableToolNames := map[string]bool{}
 	for _, t := range toolsList {
-		fn, _ := t["function"].(map[string]any)
-		if fn == nil {
-			continue
-		}
-		name := strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
+		name := strings.TrimSpace(t.Function.Name)
 		if name != "" {
 			availableToolNames[name] = true
 		}
@@ -624,87 +651,65 @@ func ConvertMessages(
 	toolCallIDToName := map[string]string{}  // 工具调用 ID → 工具名称映射
 
 	for _, message := range messages {
-		role, _ := message["role"].(string)
+		role := message.Role
 		if role == "" {
 			role = "context"
 		}
-		content := message["content"]
+		content := message.Content
 
 		// 用户消息：提取文本并更新最新 URL（用于工具调用的 fallback）
 		if role == "user" {
-			currentText := ExtractTextContent(content)
+			currentText := content.Text()
 			currentURL := ExtractFirstURL(currentText)
 			if currentURL != "" {
 				latestUserURL = currentURL
 			}
 			// 在链接和文件路径后追加 "（你未联网，要使用search相关工具）" 标注
 			// （必须在提取 URL 之后进行，避免标注污染 fallback URL）
-			content = AnnotateNoInternet(currentText)
+			content = openai.StringContent(AnnotateNoInternet(currentText))
 		}
 
 		// 助手消息：将 OpenAI tool_calls 格式转换为 GLM [function_calls] 格式
 		if role == "assistant" {
-			if _, hasToolCalls := message["tool_calls"]; hasToolCalls {
+			if len(message.ToolCalls) > 0 {
 				var toolBlocks []string
-				rawToolCalls, _ := message["tool_calls"].([]any)
-				var rawCallsList []map[string]any
-				for _, c := range rawToolCalls {
-					if m, ok := c.(map[string]any); ok {
-						rawCallsList = append(rawCallsList, m)
-					}
-				}
 				// 清理工具调用参数（修复模型输出的格式错误，包括类型矫正）
-				sanitizedToolCalls := SanitizeToolCalls(rawCallsList, latestUserURL, toolsList)
+				sanitizedToolCalls := SanitizeToolCalls(message.ToolCalls, latestUserURL, toolsList)
 				for _, tc := range sanitizedToolCalls {
-					fn, _ := tc["function"].(map[string]any)
-					toolName := "unknown"
-					if fn != nil {
-						if n, ok := fn["name"].(string); ok {
-							toolName = n
-						}
-					}
 					// 跳过不在可用工具列表中的调用
-					if len(availableToolNames) > 0 && !availableToolNames[toolName] {
+					if len(availableToolNames) > 0 && !availableToolNames[tc.Name] {
 						continue
 					}
-					args := "{}"
-					if fn != nil {
-						if a, ok := fn["arguments"].(string); ok {
-							args = a
-						}
-					}
 					// 序列化为 [function_calls] 块格式
-					toolBlocks = append(toolBlocks, tools.SerializeToolCallBlock(toolName, args))
-					toolCallID, _ := tc["id"].(string)
-					toolCallID = strings.TrimSpace(toolCallID)
+					toolBlocks = append(toolBlocks, tools.SerializeToolCallBlock(tc.Name, tc.Arguments))
+					toolCallID := strings.TrimSpace(tc.ID)
 					if toolCallID != "" && !strings.HasPrefix(toolCallID, "call_repaired_") {
 						validToolCallIDs[toolCallID] = true
-						toolCallIDToName[toolCallID] = toolName
-						if repaired, _ := tc["_repaired"].(bool); repaired {
+						toolCallIDToName[toolCallID] = tc.Name
+						if tc.Repaired {
 							repairedToolCallIDs[toolCallID] = true
 						}
 					}
 				}
 				// 合并助手文本和工具调用块
-				assistantText := strings.TrimSpace(ExtractTextContent(content))
+				assistantText := strings.TrimSpace(content.Text())
 				block := strings.Join(toolBlocks, "\n")
 				if assistantText == "" && block == "" {
 					continue
 				}
 				if assistantText != "" && block != "" {
-					content = assistantText + "\n" + block
+					content = openai.StringContent(assistantText + "\n" + block)
 				} else if assistantText != "" {
-					content = assistantText
+					content = openai.StringContent(assistantText)
 				} else {
-					content = block
+					content = openai.StringContent(block)
 				}
-			} else if content == nil {
+			} else if content.IsEmpty() {
 				continue
 			}
 		} else if role == "tool" {
 			// 工具结果消息：转换为 GLM 的 ```tool_result``` 块格式
-			toolCallID, _ := message["tool_call_id"].(string)
-			toolCallID = strings.TrimSpace(toolCallID)
+			toolCallID := strings.TrimSpace(message.ToolCallID)
 			// 跳过无效或被修复的工具调用对应的结果
 			if toolCallID != "" && len(validToolCallIDs) > 0 && !validToolCallIDs[toolCallID] {
 				continue
@@ -713,31 +718,22 @@ func ConvertMessages(
 				continue
 			}
 			role = "tool_result" // GLM 没有独立的 tool 角色，统一为 user
-			toolName, _ := message["name"].(string)
-			toolName = strings.TrimSpace(toolName)
+			toolName := strings.TrimSpace(message.Name)
 			if toolName == "" && toolCallID != "" {
 				toolName = toolCallIDToName[toolCallID]
 			}
 			if toolName == "" {
 				toolName = "unknown_tool"
 			}
-			toolResultText := ExtractTextContent(content)
+			toolResultText := content.Text()
 			callID := toolCallID
 			if callID == "" {
-				if id, ok := message["tool_call_id"].(string); ok {
-					callID = id
-				}
-				if callID == "" {
-					callID = "unknown"
-				}
+				callID = "unknown"
 			}
-			content = tools.SerializeToolResultBlock(callID, toolName, toolResultText)
+			content = openai.StringContent(tools.SerializeToolResultBlock(callID, toolName, toolResultText))
 		}
 
-		text := ""
-		if content != nil {
-			text = ExtractTextContent(content)
-		}
+		text := content.Text()
 		if text != "" {
 			processed = append(processed, processedItem{role: role, content: text})
 		}
@@ -774,14 +770,11 @@ func ConvertMessages(
 	prompt := strings.TrimSpace(strings.Join(transcriptParts, "\n"))
 
 	// 包装为 GLM 格式的单条 user 消息，末尾追加 "Assistant:" 引导模型生成
-	return []map[string]any{
+	return []GLMMessage{
 		{
-			"role": "user",
-			"content": []map[string]any{
-				{
-					"type": "text",
-					"text": prompt + "\n\nAssistant: ",
-				},
+			Role: "user",
+			Content: []GLMContentPart{
+				{Type: "text", Text: prompt + "\n\nAssistant: "},
 			},
 		},
 	}
@@ -801,13 +794,13 @@ func ConvertMessages(
 //   - 生成符合 OpenAI SSE 规范的 JSON chunks
 type GLMEventAccumulator struct {
 	// 公开字段
-	Model           string           // 模型名称（如 "glm-4-flash"）
-	FallbackToolURL string           // 工具调用的 fallback URL（来自用户消息）
-	ToolsList       []map[string]any // 工具定义列表（用于参数类型矫正）
-	DebugEnabled    bool             // 是否启用调试日志
-	Logger          *slog.Logger     // 日志记录器
-	ConversationID  string           // GLM 会话 ID（从第一个事件中提取）
-	Created         int64            // 响应创建时间戳（Unix 秒）
+	Model           string        // 模型名称（如 "glm-4-flash"）
+	FallbackToolURL string        // 工具调用的 fallback URL（来自用户消息）
+	ToolsList       []openai.Tool // OpenAI 格式工具定义列表（用于参数类型矫正）
+	DebugEnabled    bool          // 是否启用调试日志
+	Logger          *slog.Logger  // 日志记录器
+	ConversationID  string        // GLM 会话 ID（从第一个事件中提取）
+	Created         int64         // 响应创建时间戳（Unix 秒）
 
 	// parts 管理
 	partsByLogicID            map[string]map[string]any // logic_id → part 数据
@@ -831,8 +824,8 @@ type GLMEventAccumulator struct {
 	cachedPartReasonings map[string]string // 每个 part 的渲染推理缓存
 
 	// 服务端工具调用
-	serverSideToolCalls   []map[string]any // GLM 服务端原生工具调用列表
-	serverSideToolCallIDs map[string]bool  // 已记录的服务端工具调用 ID（去重用）
+	serverSideToolCalls   []SanitizedToolCall // GLM 服务端原生工具调用列表
+	serverSideToolCallIDs map[string]bool     // 已记录的服务端工具调用 ID（去重用）
 }
 
 // NewGLMEventAccumulator 创建 GLM 事件累加器
@@ -841,9 +834,9 @@ type GLMEventAccumulator struct {
 //   - model: 模型名称
 //   - fallbackToolURL: 工具调用的 fallback URL（通常来自用户消息中的 URL）
 //   - debugEnabled: 是否启用调试日志
-//   - toolsList: 工具定义列表（用于参数类型矫正）
+//   - toolsList: OpenAI 格式工具定义列表（用于参数类型矫正）
 //   - logger: 日志记录器（nil 时使用空 logger）
-func NewGLMEventAccumulator(model string, fallbackToolURL string, toolsList []map[string]any, debugEnabled bool, logger *slog.Logger) *GLMEventAccumulator {
+func NewGLMEventAccumulator(model string, fallbackToolURL string, toolsList []openai.Tool, debugEnabled bool, logger *slog.Logger) *GLMEventAccumulator {
 	if logger == nil {
 		logger = logging.GetLogger("glm2api.null")
 	}
@@ -1006,14 +999,12 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 						// 去重：同一个 toolID 只记录一次
 						if toolName != "" && toolID != "" && !a.serverSideToolCallIDs[toolID] {
 							a.serverSideToolCallIDs[toolID] = true
-							a.serverSideToolCalls = append(a.serverSideToolCalls, map[string]any{
-								"id":    toolID,
-								"type":  "function",
-								"index": len(a.serverSideToolCalls),
-								"function": map[string]any{
-									"name":      toolName,
-									"arguments": argsStr,
-								},
+							a.serverSideToolCalls = append(a.serverSideToolCalls, SanitizedToolCall{
+								Index:     len(a.serverSideToolCalls),
+								ID:        toolID,
+								Type:      "function",
+								Name:      toolName,
+								Arguments: argsStr,
 							})
 						}
 						a.Logger.Info("Server-side tool call:", "name:", toolName, "args:", argsStr)
@@ -1033,34 +1024,28 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 
 	// 生成推理内容增量 chunk（reasoning_content 字段）
 	if reasoningDelta != "" {
-		chunks = append(chunks, a.chunkJSON(map[string]any{
-			"choices": []map[string]any{
-				{
-					"index":         0,
-					"delta":         map[string]any{"reasoning_content": reasoningDelta},
-					"finish_reason": nil,
-				},
-			},
+		chunks = append(chunks, a.chunkJSON(openai.ChatCompletionChunk{
+			Choices: []openai.ChunkChoice{{
+				Index: 0,
+				Delta: openai.ChunkDelta{ReasoningContent: reasoningDelta},
+			}},
 		}))
 	}
 
 	// 将文本增量通过 toolParser 过滤（去除工具调用标记），得到可见文本
 	visibleTextDelta := a.toolParser.Consume(textDelta)
 	if visibleTextDelta != "" {
-		deltaPayload := map[string]any{"content": visibleTextDelta}
+		delta := openai.ChunkDelta{Content: visibleTextDelta}
 		if !a.emittedRole {
 			// 首次输出时需要包含 role 字段
-			deltaPayload = map[string]any{"role": "assistant", "content": visibleTextDelta}
+			delta.Role = "assistant"
 			a.emittedRole = true
 		}
-		chunks = append(chunks, a.chunkJSON(map[string]any{
-			"choices": []map[string]any{
-				{
-					"index":         0,
-					"delta":         deltaPayload,
-					"finish_reason": nil,
-				},
-			},
+		chunks = append(chunks, a.chunkJSON(openai.ChatCompletionChunk{
+			Choices: []openai.ChunkChoice{{
+				Index: 0,
+				Delta: delta,
+			}},
 		}))
 	}
 	logging.DebugDump(a.Logger, a.DebugEnabled, "GLM SSE 生成增量块", chunks)
@@ -1086,20 +1071,16 @@ func (a *GLMEventAccumulator) ConsumeEvent(payload map[string]any) ([]string, st
 //
 // wkf
 func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) []string {
-	// 刷新工具解析器，获取解析出的工具调用
-	jsonToolCalls := a.toolParser.Flush()
-	a.Logger.Info("finalize: tool parser flush", "jsonToolCalls", jsonToolCalls)
-	jsonToolCalls = SanitizeToolCalls(jsonToolCalls, a.FallbackToolURL, a.ToolsList)
+	// 刷新工具解析器，获取解析出的工具调用（解析器输出为 GLM 文本解析产物，边界处转为类型化）
+	rawToolCalls := a.toolParser.Flush()
+	a.Logger.Info("finalize: tool parser flush", "rawToolCalls", rawToolCalls)
+	jsonToolCalls := SanitizeToolCalls(toolCallsFromRaw(rawToolCalls), a.FallbackToolURL, a.ToolsList)
 	// 合并服务端工具调用和 JSON 工具调用，重新索引
-	allToolCalls := make([]map[string]any, len(a.serverSideToolCalls))
-	copy(allToolCalls, a.serverSideToolCalls)
+	allToolCalls := make([]SanitizedToolCall, 0, len(a.serverSideToolCalls)+len(jsonToolCalls))
+	allToolCalls = append(allToolCalls, a.serverSideToolCalls...)
 	for _, tc := range jsonToolCalls {
-		tcCopy := map[string]any{}
-		for k, v := range tc {
-			tcCopy[k] = v
-		}
-		tcCopy["index"] = len(allToolCalls)
-		allToolCalls = append(allToolCalls, tcCopy)
+		tc.Index = len(allToolCalls)
+		allToolCalls = append(allToolCalls, tc)
 	}
 
 	if a.Logger != nil {
@@ -1115,15 +1096,12 @@ func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) 
 	var chunks []string
 	// 处理 GLM 的 intervene（干预）状态：输出干预文本
 	if status == "intervene" && lastError != nil {
-		if interveneText, ok := lastError["intervene_text"].(string); ok && interveneText != "" {
-			chunks = append(chunks, a.chunkJSON(map[string]any{
-				"choices": []map[string]any{
-					{
-						"index":         0,
-						"delta":         map[string]any{"content": "\n\n" + interveneText},
-						"finish_reason": nil,
-					},
-				},
+		if interveneText, _ := lastError["intervene_text"].(string); interveneText != "" {
+			chunks = append(chunks, a.chunkJSON(openai.ChatCompletionChunk{
+				Choices: []openai.ChunkChoice{{
+					Index: 0,
+					Delta: openai.ChunkDelta{Content: "\n\n" + interveneText},
+				}},
 			}))
 		}
 	}
@@ -1131,36 +1109,27 @@ func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) 
 	// 输出所有工具调用 chunks
 	if len(allToolCalls) > 0 {
 		if !a.emittedRole {
-			chunks = append(chunks, a.chunkJSON(map[string]any{
-				"choices": []map[string]any{
-					{
-						"index":         0,
-						"delta":         map[string]any{"role": "assistant"},
-						"finish_reason": nil,
-					},
-				},
+			chunks = append(chunks, a.chunkJSON(openai.ChatCompletionChunk{
+				Choices: []openai.ChunkChoice{{
+					Index: 0,
+					Delta: openai.ChunkDelta{Role: "assistant"},
+				}},
 			}))
 			a.emittedRole = true
 		}
 		for _, tc := range allToolCalls {
-			fn := tc["function"]
-			chunks = append(chunks, a.chunkJSON(map[string]any{
-				"choices": []map[string]any{
-					{
-						"index": 0,
-						"delta": map[string]any{
-							"tool_calls": []map[string]any{
-								{
-									"index":    tc["index"],
-									"id":       tc["id"],
-									"type":     "function",
-									"function": fn,
-								},
-							},
-						},
-						"finish_reason": nil,
+			chunks = append(chunks, a.chunkJSON(openai.ChatCompletionChunk{
+				Choices: []openai.ChunkChoice{{
+					Index: 0,
+					Delta: openai.ChunkDelta{
+						ToolCalls: []openai.ChunkToolCall{{
+							Index:    tc.Index,
+							ID:       tc.ID,
+							Type:     "function",
+							Function: &openai.ToolCallFunction{Name: tc.Name, Arguments: tc.Arguments},
+						}},
 					},
-				},
+				}},
 			}))
 		}
 	}
@@ -1170,18 +1139,15 @@ func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) 
 	if len(allToolCalls) > 0 {
 		finishReason = "tool_calls"
 	}
-	chunks = append(chunks, a.chunkJSON(map[string]any{
-		"choices": []map[string]any{
-			{
-				"index":         0,
-				"delta":         map[string]any{},
-				"finish_reason": finishReason,
-			},
-		},
-		"usage": map[string]any{
-			"prompt_tokens":     1,
-			"completion_tokens": 1,
-			"total_tokens":      2,
+	chunks = append(chunks, a.chunkJSON(openai.ChatCompletionChunk{
+		Choices: []openai.ChunkChoice{{
+			Index:        0,
+			FinishReason: &finishReason,
+		}},
+		Usage: &openai.Usage{
+			PromptTokens:     1,
+			CompletionTokens: 1,
+			TotalTokens:      2,
 		},
 	}))
 	chunks = append(chunks, "data: [DONE]\n\n")
@@ -1199,24 +1165,6 @@ func (a *GLMEventAccumulator) GetOrderedParts() []map[string]any {
 		}
 	}
 	return result
-}
-
-// extractReasoningToolCalls 从推理内容中尝试提取工具调用
-// 优先使用传入的 reasoningText，为空时依次回退到 lastFullReasoning 和 cachedFullReasoning
-// 用于处理模型将工具调用输出在推理内容（think）中的情况
-func (a *GLMEventAccumulator) extractReasoningToolCalls(reasoningText string) []map[string]any {
-	source := reasoningText
-	if source == "" {
-		source = a.lastFullReasoning
-	}
-	if source == "" {
-		source = a.cachedFullReasoning
-	}
-	if source == "" {
-		return nil
-	}
-	_, toolCalls := tools.ParseToolCallsFromText(strings.TrimSpace(source))
-	return SanitizeToolCalls(toolCalls, a.FallbackToolURL, a.ToolsList)
 }
 
 // isIncreasePushPayload 判断事件是否为增量推送模式（meta_data.if_increase_push=true）。
@@ -1434,20 +1382,15 @@ func (a *GLMEventAccumulator) renderFullOutput() (string, string) {
 	return a.cachedFullText, a.cachedFullReasoning
 }
 
-// chunkJSON 将 patch 中的字段合并到标准 chunk 模板中，序列化为 SSE 格式
-// 标准模板包含 id、object、created、model 字段
+// chunkJSON 将 chunk 序列化为 SSE 格式
+// 公共字段（id、object、created、model）在此统一填充
 // 返回格式："data: {json}\n\n"
-func (a *GLMEventAccumulator) chunkJSON(patch map[string]any) string {
-	payload := map[string]any{
-		"id":      a.ConversationID,
-		"object":  "chat.completion.chunk",
-		"created": a.Created,
-		"model":   a.Model,
-	}
-	for k, v := range patch {
-		payload[k] = v
-	}
-	jsonStr, err := sonic.MarshalString(payload)
+func (a *GLMEventAccumulator) chunkJSON(chunk openai.ChatCompletionChunk) string {
+	chunk.ID = a.ConversationID
+	chunk.Object = "chat.completion.chunk"
+	chunk.Created = a.Created
+	chunk.Model = a.Model
+	jsonStr, err := sonic.MarshalString(chunk)
 	if err != nil {
 		return "data: {}\n\n"
 	}

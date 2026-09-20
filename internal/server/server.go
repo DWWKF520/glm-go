@@ -13,6 +13,7 @@ import (
 	"glm2api/internal/config"
 	"glm2api/internal/glmclient"
 	"glm2api/internal/logging"
+	"glm2api/internal/openai"
 )
 
 // Server HTTP 服务器
@@ -207,8 +208,8 @@ func (s *Server) handleRoot(c *gin.Context) {
 }
 
 func (s *Server) handleChatCompletions(c *gin.Context) {
-	var payload map[string]any
-	if err := c.ShouldBindJSON(&payload); err != nil {
+	var req openai.ChatCompletionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": gin.H{
 				"message": "请求体解析失败: " + err.Error(),
@@ -218,12 +219,12 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 		return
 	}
 
-	s.handleChatCompletionsStream(c, payload)
+	s.handleChatCompletionsStream(c, &req)
 }
 
-func (s *Server) handleChatCompletionsStream(c *gin.Context, payload map[string]any) {
+func (s *Server) handleChatCompletionsStream(c *gin.Context, req *openai.ChatCompletionRequest) {
 	ctx := c.Request.Context()
-	ch, err := s.client.StreamChatCompletion(ctx, payload)
+	ch, err := s.client.StreamChatCompletion(ctx, req)
 	if err != nil {
 		s.writeError(c, err)
 		return
@@ -256,8 +257,8 @@ func (s *Server) handleChatCompletionsStream(c *gin.Context, payload map[string]
 }
 
 func (s *Server) handleImagesGenerations(c *gin.Context) {
-	var payload map[string]any
-	if err := c.ShouldBindJSON(&payload); err != nil {
+	var req openai.ImageGenerationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": gin.H{
 				"message": "请求体解析失败: " + err.Error(),
@@ -267,7 +268,7 @@ func (s *Server) handleImagesGenerations(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	response, err := s.client.GenerateImages(ctx, payload)
+	response, err := s.client.GenerateImages(ctx, &req)
 	if err != nil {
 		s.writeError(c, err)
 		return

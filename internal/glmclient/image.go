@@ -25,6 +25,7 @@ import (
 
 	"glm2api/internal/auth"
 	"glm2api/internal/logging"
+	"glm2api/internal/openai"
 	"glm2api/internal/translator"
 )
 
@@ -48,20 +49,24 @@ var sizePattern = regexp.MustCompile(`^\d+x\d+$`)
 //  2. 打开图片生成流
 //  3. 读取所有事件直到 finish
 //  4. 从累积器中提取图片 URL 并构建响应
-func (c *Client) GenerateImages(ctx context.Context, payload map[string]any) (map[string]any, error) {
-	lease, err := c.RequestQueue.Acquire(fmt.Sprintf("image:%v", payload["model"]))
+func (c *Client) GenerateImages(ctx context.Context, req *openai.ImageGenerationRequest) (*openai.ImagesResponse, error) {
+	lease, err := c.RequestQueue.Acquire(fmt.Sprintf("image:%s", req.Model))
 	if err != nil {
 		return nil, err
 	}
 
-	response, assistantID, err := c.openImageStream(ctx, payload, c.getPreferredAccountIndex(lease.ticket))
+	response, assistantID, err := c.openImageStream(ctx, req, c.getPreferredAccountIndex(lease.ticket))
 	if err != nil {
 		lease.Release()
 		return nil, err
 	}
 
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = c.config.GLMImageModelName
+	}
 	accumulator := translator.NewGLMEventAccumulator(
-		getModelName(payload, c.config.GLMImageModelName),
+		model,
 		"",
 		nil, // 图片生成无需工具定义
 		c.config.DebugDumpAll,
@@ -93,29 +98,37 @@ func (c *Client) GenerateImages(ctx context.Context, payload map[string]any) (ma
 			break
 		}
 	}
-	return c.buildImagesResponse(payload, finalEvent, accumulator)
+	return c.buildImagesResponse(req, finalEvent, accumulator)
 }
 
 // openImageStream 打开与 GLM 的图片生成连接
 // 构建 cogview 绘图请求并通过账号故障转移发送
-func (c *Client) openImageStream(ctx context.Context, payload map[string]any, preferredAccountIndex *int) (*http.Response, string, error) {
-	prompt, _ := payload["prompt"].(string)
-	prompt = strings.TrimSpace(prompt)
+func (c *Client) openImageStream(ctx context.Context, req *openai.ImageGenerationRequest, preferredAccountIndex *int) (*http.Response, string, error) {
+	prompt := strings.TrimSpace(req.Prompt)
 	if prompt == "" {
 		return nil, "", &UpstreamAPIError{StatusCode: 400, Message: "图片生成请求缺少 prompt"}
 	}
 
 	// 解析图片尺寸并转换为宽高比
-	size, _ := payload["size"].(string)
+	size := strings.ToLower(strings.TrimSpace(req.Size))
 	if size == "" {
 		size = "1024x1024"
 	}
-	size = strings.ToLower(strings.TrimSpace(size))
 	aspectRatio := c.resolveAspectRatio(size)
 
-	userModel, _ := payload["model"].(string)
-	if strings.TrimSpace(userModel) == "" {
+	userModel := strings.TrimSpace(req.Model)
+	if userModel == "" {
 		userModel = c.config.GLMImageModelName
+	}
+
+	// 风格与场景参数（本代理扩展），缺省为 "none"
+	style := strings.ToLower(strings.TrimSpace(req.Style))
+	if style == "" {
+		style = "none"
+	}
+	scene := strings.ToLower(strings.TrimSpace(req.Scene))
+	if scene == "" {
+		scene = "none"
 	}
 
 	// 构建 GLM 图片生成请求体
@@ -127,8 +140,8 @@ func (c *Client) openImageStream(ctx context.Context, payload map[string]any, pr
 		"meta_data": map[string]any{
 			"cogview": map[string]any{
 				"aspect_ratio":       aspectRatio,
-				"style":              c.resolveImageStyle(payload),
-				"scene":              c.resolveImageScene(payload),
+				"style":              style,
+				"scene":              scene,
 				"chat_model":         "",
 				"rm_label_watermark": false,
 			},
@@ -152,8 +165,8 @@ func (c *Client) openImageStream(ctx context.Context, payload map[string]any, pr
 	}
 	bodyBytes, _ := sonic.Marshal(requestBody)
 
-	c.logger.Info("转发绘图请求", "model", userModel, "assistant_id", c.config.GLMImageAssistantID, "size", size, "n", payload["n"])
-	logging.DebugDump(c.logger, c.config.DebugDumpAll, "OpenAI 原始 image 请求 payload", payload)
+	c.logger.Info("转发绘图请求", "model", userModel, "assistant_id", c.config.GLMImageAssistantID, "size", size, "n", req.N)
+	logging.DebugDump(c.logger, c.config.DebugDumpAll, "OpenAI 原始 image 请求 payload", req)
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "转发到 GLM 的 image 原始请求体", bodyBytes)
 
 	operation := func(accountIndex int, accessToken string) (any, error) {
@@ -203,16 +216,21 @@ func (c *Client) openImageStream(ctx context.Context, payload map[string]any, pr
 // 支持两种响应格式：
 //   - "url": 返回图片的直接 URL
 //   - "b64_json": 下载图片并转换为 base64 编码
-func (c *Client) buildImagesResponse(requestPayload map[string]any, finalEvent map[string]any, accumulator *translator.GLMEventAccumulator) (map[string]any, error) {
-	requestedCount := coercePositiveInt(requestPayload["n"], 1, 10)
-	responseFormat, _ := requestPayload["response_format"].(string)
-	responseFormat = strings.ToLower(strings.TrimSpace(responseFormat))
+func (c *Client) buildImagesResponse(req *openai.ImageGenerationRequest, finalEvent map[string]any, accumulator *translator.GLMEventAccumulator) (*openai.ImagesResponse, error) {
+	requestedCount := int(req.N)
+	if requestedCount < 1 {
+		requestedCount = 1
+	}
+	if requestedCount > 10 {
+		requestedCount = 10
+	}
+	responseFormat := strings.ToLower(strings.TrimSpace(req.ResponseFormat))
 	if responseFormat == "" {
 		responseFormat = "url"
 	}
 	created := time.Now().Unix()
 
-	var data []map[string]any
+	var data []openai.ImageData
 	orderedParts := accumulator.GetOrderedParts()
 
 	for _, part := range orderedParts {
@@ -255,18 +273,18 @@ func (c *Client) buildImagesResponse(requestPayload map[string]any, finalEvent m
 				if imageURL == "" {
 					continue
 				}
-				item := map[string]any{}
+				item := openai.ImageData{}
 				if responseFormat == "b64_json" {
 					b64, err := c.downloadImageAsBase64(imageURL)
 					if err != nil {
 						return nil, err
 					}
-					item["b64_json"] = b64
+					item.B64JSON = b64
 				} else {
-					item["url"] = imageURL
+					item.URL = imageURL
 				}
 				if revisedPrompt != "" {
-					item["revised_prompt"] = revisedPrompt
+					item.RevisedPrompt = revisedPrompt
 				}
 				data = append(data, item)
 			}
@@ -281,9 +299,9 @@ func (c *Client) buildImagesResponse(requestPayload map[string]any, finalEvent m
 		}
 	}
 	c.logger.Info("绘图完成", "返回图片数", len(data))
-	return map[string]any{
-		"created": created,
-		"data":    data,
+	return &openai.ImagesResponse{
+		Created: created,
+		Data:    data,
 	}, nil
 }
 
@@ -307,26 +325,6 @@ func (c *Client) resolveAspectRatio(size string) string {
 		return fmt.Sprintf("%d:%d", w, h)
 	}
 	return "1:1"
-}
-
-// resolveImageStyle 从 payload 中提取图片风格参数
-func (c *Client) resolveImageStyle(payload map[string]any) string {
-	style, _ := payload["style"].(string)
-	style = strings.ToLower(strings.TrimSpace(style))
-	if style == "" {
-		return "none"
-	}
-	return style
-}
-
-// resolveImageScene 从 payload 中提取图片场景参数
-func (c *Client) resolveImageScene(payload map[string]any) string {
-	scene, _ := payload["scene"].(string)
-	scene = strings.ToLower(strings.TrimSpace(scene))
-	if scene == "" {
-		return "none"
-	}
-	return scene
 }
 
 // downloadImageAsBase64 下载图片并转换为 base64 编码字符串

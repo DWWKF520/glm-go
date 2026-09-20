@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -19,6 +20,7 @@ import (
 
 	"glm2api/internal/auth"
 	"glm2api/internal/logging"
+	"glm2api/internal/openai"
 	"glm2api/internal/tools"
 	"glm2api/internal/translator"
 )
@@ -27,34 +29,33 @@ import (
 // 将 OpenAI 格式的 chat completion 请求转发到 GLM Web API，以 SSE 流式返回结果
 //
 // 流程：
-//  1. 从请求中提取并过滤工具定义
-//  2. 从并发队列获取执行槽位（租约）
-//  3. 打开与 GLM 的流式连接
-//  4. 在 goroutine 中持续读取 SSE 事件，通过 accumulator 转换为 OpenAI 格式
-//  5. 若流中途断开，使用 continue_stream API 从 history_id（最后一个事件的 id 字段）处续流
-//  6. 完成后删除 GLM 会话并释放队列槽位
+//  1. 校验请求并从并发队列获取执行槽位（租约）
+//  2. 打开与 GLM 的流式连接
+//  3. 在 goroutine 中持续读取 SSE 事件，通过 accumulator 转换为 OpenAI 格式
+//  4. 若流中途断开，使用 continue_stream API 从 history_id（最后一个事件的 id 字段）处续流
+//  5. 完成后删除 GLM 会话并释放队列槽位
 //
 // 返回值：一个 channel，持续输出 SSE 格式的 []byte chunks
 // wkf
-func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]any) (<-chan []byte, error) {
-	lease, err := c.RequestQueue.Acquire(fmt.Sprintf("stream:%v", payload["model"]))
+func (c *Client) StreamChatCompletion(ctx context.Context, req *openai.ChatCompletionRequest) (<-chan []byte, error) {
+	if strings.TrimSpace(req.Model) == "" {
+		return nil, &UpstreamAPIError{StatusCode: http.StatusBadRequest, Message: "chat completion 请求缺少 model 字段"}
+	}
+	lease, err := c.RequestQueue.Acquire(fmt.Sprintf("stream:%s", req.Model))
 	if err != nil {
 		return nil, err
 	}
 
-	response, assistantID, err := c.openChatStream(ctx, payload, c.getPreferredAccountIndex(lease.ticket))
+	response, assistantID, err := c.openChatStream(ctx, req, c.getPreferredAccountIndex(lease.ticket))
 	if err != nil {
 		lease.Release()
 		return nil, err
 	}
 
-	// 获取工具定义列表（用于参数类型矫正）
-	filteredTools := c.resolveTools(payload)
-
 	accumulator := translator.NewGLMEventAccumulator(
-		fmt.Sprintf("%v", payload["model"]),
-		translator.ExtractRecentUserURL(getMessagesList(payload)),
-		filteredTools,
+		req.Model,
+		translator.ExtractRecentUserURL(req.Messages),
+		req.Tools,
 		c.config.DebugDumpAll,
 		c.logger,
 	)
@@ -293,37 +294,28 @@ func (c *Client) continueStream(ctx context.Context, historyID string, preferred
 // 构建 GLM 格式的请求体，通过账号故障转移机制发送请求，返回 HTTP 响应流
 //
 // 核心步骤：
-//  1. 从 OpenAI payload 中解析工具定义
-//  2. 调用 ConvertMessages 将 OpenAI 消息格式转换为 GLM 格式
-//  3. 上传消息中引用的图片和文件附件
-//  4. 构建 GLM 请求体（含 meta_data、chat_mode 等）
-//  5. 通过 callWithAccountFailover 发送请求，自动处理忙碌重试
-func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]any, preferredAccountIndex *int) (*http.Response, string, error) {
-	upstreamModel := openaiPayload["model"].(string)
+//  1. 调用 ConvertMessages 将 OpenAI 消息格式转换为 GLM 格式
+//  2. 上传消息中引用的图片和文件附件
+//  3. 构建 GLM 请求体（含 meta_data、chat_mode 等）
+//  4. 通过 callWithAccountFailover 发送请求，自动处理忙碌重试
+func (c *Client) openChatStream(ctx context.Context, req *openai.ChatCompletionRequest, preferredAccountIndex *int) (*http.Response, string, error) {
+	upstreamModel := req.Model
 	assistantID := c.config.GLMAssistantID
-	filteredTools := c.resolveTools(openaiPayload)
 
 	// 将 OpenAI 消息格式转换为 GLM 能理解的文本提示词格式
 	convertedMessages := translator.ConvertMessages(
-		getMessagesList(openaiPayload),
-		filteredTools,
+		req.Messages,
+		req.Tools,
 		tools.ServerSideToolNames,
 	)
 
-	logging.DebugDump(c.logger, c.config.DebugDumpAll, "OpenAI 原始 chat 请求 payload", openaiPayload)
+	logging.DebugDump(c.logger, c.config.DebugDumpAll, "OpenAI 原始 chat 请求 payload", req)
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "转换后的 GLM messages", convertedMessages)
 
 	// 上传消息中引用的图片和文件附件，将上传后的引用前置到 GLM 消息 content 中
-	refs := c.uploadReferencedFiles(ctx, getMessagesList(openaiPayload))
+	refs := c.uploadReferencedFiles(ctx, req.Messages)
 	if len(refs) > 0 {
-		if contentList, ok := convertedMessages[0]["content"].([]map[string]any); ok {
-			merged := make([]any, 0, len(refs)+len(contentList))
-			merged = append(merged, refs...)
-			for _, item := range contentList {
-				merged = append(merged, item)
-			}
-			convertedMessages[0]["content"] = merged
-		}
+		convertedMessages[0].Content = append(refs, convertedMessages[0].Content...)
 		logging.DebugDump(c.logger, c.config.DebugDumpAll, "附加上传引用后的 GLM messages", convertedMessages)
 	}
 
@@ -350,7 +342,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 	}
 
 	bodyBytes, _ := sonic.Marshal(requestBody)
-	c.logger.Info("转发请求", "upstream", upstreamModel, "stream", openaiPayload["stream"])
+	c.logger.Info("转发请求", "upstream", upstreamModel, "stream", req.Stream)
 	logging.DebugDump(c.logger, c.config.DebugDumpAll, "转发到 GLM 的 chat 原始请求体", bodyBytes)
 
 	// 定义请求操作（支持忙碌重试）
