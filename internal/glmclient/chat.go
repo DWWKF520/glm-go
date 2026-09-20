@@ -100,7 +100,7 @@ func (c *Client) StreamChatCompletion(ctx context.Context, req *openai.ChatCompl
 					"attempt", attempt+1, "account", nextIdx,
 					"max", c.config.GLMStreamContinueMaxRetries)
 				c.Auth.AdvanceAccount(*preferredIdx, "stream_error_10062_retry")
-				newResp, _, err := c.openChatStream(ctx, payload, &nextIdx)
+				newResp, _, err := c.openChatStream(ctx, req, &nextIdx)
 				if err != nil {
 					c.logger.Warn("GLM 重试打开流失败", "error", err)
 					break
