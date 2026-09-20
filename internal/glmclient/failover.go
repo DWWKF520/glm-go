@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -535,6 +536,32 @@ func (c *Client) shouldRetryBusyError(statusCode int, payload map[string]any) bo
 	message, _ := payload["message"].(string)
 	innerStatus := getAny(payload, "status")
 	return (innerStatus != nil && innerStatus == 10061) || strings.Contains(message, "请等待其他对话生成完毕")
+}
+
+// isRetryableStreamError 判断流式事件错误是否可重试（如 code=10062 高峰期排队）
+// 当 GLM 流式事件所有 part 均返回此类错误时，调用方应重新打开流而非跳过
+func (c *Client) isRetryableStreamError(err error) bool {
+	var apiErr *UpstreamAPIError
+	if !errors.As(err, &apiErr) || apiErr.Payload == nil {
+		return false
+	}
+	code := getAny(apiErr.Payload, "code")
+	if code == nil {
+		code = getAny(apiErr.Payload, "error_code")
+	}
+	if code == nil {
+		return false
+	}
+	switch v := code.(type) {
+	case float64:
+		return v == 10062
+	case int:
+		return v == 10062
+	case int64:
+		return v == 10062
+	default:
+		return fmt.Sprintf("%v", v) == "10062"
+	}
 }
 
 // buildErrorMessage 构建人类可读的错误消息

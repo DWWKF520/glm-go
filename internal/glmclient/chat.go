@@ -77,9 +77,36 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 
 		currentResp := response
 		for attempt := 0; ; attempt++ {
-			finished, historyID, scanErr := c.drainStream(currentResp, accumulator, out)
+			finished, historyID, scanErr, retry := c.drainStream(currentResp, accumulator, out)
 			if finished {
 				return
+			}
+			// 流式事件遇到可重试错误（如 code=10062 高峰期排队），立即切换到下一个账号重新打开流
+			if retry {
+				if attempt >= c.config.GLMStreamContinueMaxRetries {
+					c.logger.Warn("GLM 流式重试次数耗尽",
+						"attempt", attempt+1, "max", c.config.GLMStreamContinueMaxRetries)
+					break
+				}
+				preferredIdx := c.getPreferredAccountIndex(lease.ticket)
+				if preferredIdx == nil {
+					c.logger.Warn("GLM 流式事件触发重试后无可用账号", "attempt", attempt+1)
+					break
+				}
+				// 每次重试切换到下一个账号，避免反复命中排队账号
+				nextIdx := (*preferredIdx + attempt + 1) % c.Auth.GetAccountCount()
+				c.logger.Warn("GLM 流式事件触发重试，切换到下一个账号重新打开流",
+					"attempt", attempt+1, "account", nextIdx,
+					"max", c.config.GLMStreamContinueMaxRetries)
+				c.Auth.AdvanceAccount(*preferredIdx, "stream_error_10062_retry")
+				newResp, _, err := c.openChatStream(ctx, payload, &nextIdx)
+				if err != nil {
+					c.logger.Warn("GLM 重试打开流失败", "error", err)
+					break
+				}
+				usedContinueStream = true
+				currentResp = newResp
+				continue
 			}
 			// 流正常结束（未收到 finish 状态），执行收尾
 			if scanErr == nil {
@@ -117,9 +144,10 @@ func (c *Client) StreamChatCompletion(ctx context.Context, payload map[string]an
 //   - finished: 是否已收到终止状态（finish/intervene/tool_call_complete），此时收尾已完成
 //   - historyID: 最后一个事件的 id 字段（断流续流时作为 continue_stream 的 history_id）
 //   - scanErr: 读流错误，nil 表示流正常结束
+//   - retry: 遇到可重试的流式错误（如 code=10062 高峰期排队），调用方应重新打开流
 //
-// 调用方负责在 scanErr != nil 且 historyID != "" 时通过 continueStream 续流。
-func (c *Client) drainStream(response *http.Response, accumulator *translator.GLMEventAccumulator, out chan<- []byte) (bool, string, error) {
+// 调用方负责在 retry=true 时重新打开流，或在 scanErr != nil 且 historyID != "" 时通过 continueStream 续流。
+func (c *Client) drainStream(response *http.Response, accumulator *translator.GLMEventAccumulator, out chan<- []byte) (bool, string, error, bool) {
 	defer response.Body.Close()
 	// 用 ctx 标记"主动结束"：收到终止状态后 cancel()，
 	// 这样 iterSSEEvents 的读流 goroutine 在 body 被关闭时不会误报 WARNING。
@@ -137,6 +165,9 @@ func (c *Client) drainStream(response *http.Response, accumulator *translator.GL
 		// 检查事件中是否有错误 part，尝试过滤掉错误部分后继续处理
 		if err := c.raiseForEventError(event, true); err != nil {
 			c.logger.Warn("GLM 流式事件所有 part 均有错误，跳过此事件", "error", err)
+			if c.isRetryableStreamError(err) {
+				return false, historyID, nil, true
+			}
 			continue
 		}
 		// 将 GLM 事件转换为 OpenAI 格式的 SSE chunks
@@ -152,11 +183,11 @@ func (c *Client) drainStream(response *http.Response, accumulator *translator.GL
 			}
 			// 主动取消：通知读流 goroutine 即将关闭 body，无需记录中断告警
 			cancel()
-			return true, historyID, nil
+			return true, historyID, nil, false
 		}
 	}
 	scanErr := <-scanErrCh
-	return false, historyID, scanErr
+	return false, historyID, scanErr, false
 }
 
 // continueStream 通过 GLM continue_stream API 从中断处继续流式响应
@@ -309,7 +340,7 @@ func (c *Client) openChatStream(ctx context.Context, openaiPayload map[string]an
 			"draft_id":            "",
 			"if_plus_model":       true,
 			"input_question_type": "xxxx",
-			"selected_model":      "glm-5.3", //glm-5.3-flash
+			"selected_model":      "glm-5.3-flash", //glm-5.3-flash
 			"is_networking":       false,
 			"is_test":             false,
 			"platform":            "pc",
