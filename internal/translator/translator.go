@@ -181,6 +181,204 @@ func ExtractRecentUserURL(messages []map[string]any) string {
 	return ""
 }
 
+// --- 工作目录与已知路径推断 ---
+//
+// GLM 无法访问客户端文件系统，经常臆造或用错文件路径，导致工具调用失败。
+// ConvertMessages 会扫描对话中已经出现过的绝对路径，推断工作目录并汇总为
+// "# WORKSPACE" 段落注入提示词，让模型直接复用这些"确证存在"的路径。
+
+var (
+	// winAbsPathRE 匹配 Windows 绝对路径（盘符 + 反斜杠），天然不会命中 URL
+	winAbsPathRE = regexp.MustCompile(`(?i)[a-z]:\\[^\s<>"|?*\r\n\t]+`)
+	// posixAbsPathRE 匹配 POSIX 绝对路径（至少两段），如 /home/wkf/a.go
+	posixAbsPathRE = regexp.MustCompile(`/[^\s<>"'|?*:\r\n\t/]+(?:/[^\s<>"'|?*:\r\n\t/]+)+`)
+	// urlRE 匹配 URL，提取路径前先剔除，避免 "https://host/a/b" 里的 "/a/b" 被误判为文件路径
+	urlRE = regexp.MustCompile(`(?i)[a-z][a-z0-9+.\-]*://[^\s<>"']+`)
+	// pathTrailingChars 需要从匹配结果尾部剥离的标点
+	pathTrailingChars = ".,;:!?)]}'\"`"
+	// pathIllegalChars 出现即认为不是真实文件路径（正则/HTML/URL 片段等噪声）
+	pathIllegalChars = "[]{}|<>\"'%#&=*?;`"
+)
+
+// extractAbsPaths 从文本中提取绝对路径并追加到候选集合（保持首次出现顺序）。
+// Windows 形式靠盘符天然排除 URL；POSIX 形式会跳过 URL 中（"//" 之后）的片段。
+func extractAbsPaths(text string, seen map[string]bool, order *[]string) {
+	if text == "" {
+		return
+	}
+	text = urlRE.ReplaceAllString(text, " ") // 先剔除 URL
+	for _, m := range winAbsPathRE.FindAllString(text, -1) {
+		addPathCandidate(m, seen, order)
+	}
+	for _, loc := range posixAbsPathRE.FindAllStringIndex(text, -1) {
+		if loc[0] > 0 {
+			switch text[loc[0]-1] {
+			case ':', '/':
+				continue // 属于 "https://..." 等 URL 中的片段
+			}
+		}
+		addPathCandidate(text[loc[0]:loc[1]], seen, order)
+	}
+}
+
+// addPathCandidate 清洗并校验单个路径候选，通过后去重加入集合。
+func addPathCandidate(raw string, seen map[string]bool, order *[]string) {
+	p := strings.TrimRight(raw, pathTrailingChars)
+	if !isPlausiblePath(p) || seen[p] {
+		return
+	}
+	seen[p] = true
+	*order = append(*order, p)
+}
+
+// isPlausiblePath 判断字符串是否像一条真实文件路径，用于过滤代码/正则/URL 噪声。
+func isPlausiblePath(p string) bool {
+	if len(p) < 4 || len(p) > 260 {
+		return false
+	}
+	if strings.Contains(p, "//") || !strings.ContainsAny(p, `\/`) {
+		return false
+	}
+	for _, r := range p {
+		if strings.ContainsRune(pathIllegalChars, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// isPathSep 判断字符是否为路径分隔符（兼容 Windows 与 POSIX 两种风格）。
+func isPathSep(r rune) bool { return r == '\\' || r == '/' }
+
+// splitDirComps 把路径 p 的目录部分拆成路径分量（去掉文件名）。
+// 返回分量列表、分隔符（Windows 为 \，POSIX 为 /）以及 POSIX 的绝对前缀 "/"。
+func splitDirComps(p string) (comps []string, sep, absPrefix string) {
+	last := strings.LastIndexAny(p, `\/`)
+	if last <= 0 {
+		return nil, "", ""
+	}
+	dir := p[:last]
+	if strings.ContainsRune(p, '\\') {
+		return strings.FieldsFunc(dir, isPathSep), `\`, ""
+	}
+	return strings.FieldsFunc(dir, isPathSep), "/", "/"
+}
+
+// inferWorkspaceRoot 依据路径出现频次推断工作目录：
+// 取"命中路径数最多"的目录前缀，数量相同则取层级更深者；层级不超过 maxRootDepth，
+// 并跳过 Windows 盘符根（它几乎命中所有路径，没有区分度）。推断不出时返回空字符串。
+func inferWorkspaceRoot(paths []string) string {
+	const maxRootDepth = 3
+	type cand struct{ count, depth int }
+	cands := map[string]*cand{}
+	var order []string
+	add := func(prefix string, depth int) {
+		if c, ok := cands[prefix]; ok {
+			c.count++
+			return
+		}
+		cands[prefix] = &cand{count: 1, depth: depth}
+		order = append(order, prefix)
+	}
+	for _, p := range paths {
+		comps, sep, absPrefix := splitDirComps(p)
+		if len(comps) == 0 {
+			continue
+		}
+		for d := 1; d <= len(comps) && d <= maxRootDepth; d++ {
+			if d == 1 && strings.HasSuffix(comps[0], ":") {
+				continue
+			}
+			add(absPrefix+strings.Join(comps[:d], sep), d)
+		}
+	}
+	best := ""
+	var bestCount, bestDepth int
+	for _, prefix := range order {
+		c := cands[prefix]
+		if c.count > bestCount || (c.count == bestCount && c.depth > bestDepth) {
+			best, bestCount, bestDepth = prefix, c.count, c.depth
+		}
+	}
+	return best
+}
+
+// collectWorkspacePaths 扫描对话消息，收集其中出现过的绝对路径并推断工作目录。
+// 只采用用户/系统消息与工具结果中的路径（这些更可能真实存在），
+// 不采用助手历史工具调用里的路径（可能是此前臆造的错误路径）。
+func collectWorkspacePaths(messages []map[string]any) (paths []string, root string) {
+	seen := map[string]bool{}
+	for _, msg := range messages {
+		role, _ := msg["role"].(string)
+		switch role {
+		case "user", "system", "tool":
+			extractAbsPaths(ExtractTextContent(msg["content"]), seen, &paths)
+		}
+	}
+	if len(paths) == 0 {
+		return nil, ""
+	}
+	return paths, inferWorkspaceRoot(paths)
+}
+
+// pathBase 返回路径最后一段（兼容 Windows 与 POSIX 分隔符）。
+func pathBase(p string) string {
+	if i := strings.LastIndexAny(p, `\/`); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
+// pickExampleFile 从已知路径中挑一个"文件"路径作为工具调用示例：
+// 优先选 basename 含扩展名（带点）者，找不到则退回第一个非工作目录的路径。
+func pickExampleFile(paths []string, root string) string {
+	fallback := ""
+	for _, p := range paths {
+		if p == root {
+			continue
+		}
+		if fallback == "" {
+			fallback = p
+		}
+		if strings.Contains(pathBase(p), ".") {
+			return p
+		}
+	}
+	return fallback
+}
+
+// buildWorkspaceSection 依据已知路径与推断出的工作目录，生成注入提示词的 "# WORKSPACE" 段落。
+// 未发现任何路径时返回空字符串。
+func buildWorkspaceSection(paths []string, root string) string {
+	const maxKnownPaths = 40
+	if len(paths) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("# WORKSPACE")
+	if root != "" {
+		b.WriteString("\nWorking directory: ")
+		b.WriteString(root)
+	}
+	b.WriteString("\nKnown absolute paths (they are known to exist; reuse them exactly and never guess or invent paths):")
+	shown := 0
+	for _, p := range paths {
+		if p == root {
+			continue
+		}
+		if shown >= maxKnownPaths {
+			break
+		}
+		b.WriteString("\n- ")
+		b.WriteString(p)
+		shown++
+	}
+	if shown == 0 {
+		return ""
+	}
+	return b.String()
+}
+
 // buildToolParamTypeMap 从工具定义列表中构建工具名称到参数类型映射
 //
 // 工具定义格式（OpenAI 格式）：
@@ -705,8 +903,10 @@ func ConvertMessages(
 			// 工具结果消息：转换为 GLM 的 ```tool_result``` 块格式
 			toolCallID, _ := message["tool_call_id"].(string)
 			toolCallID = strings.TrimSpace(toolCallID)
-			// 跳过无效或被修复的工具调用对应的结果
-			if toolCallID != "" && len(validToolCallIDs) > 0 && !validToolCallIDs[toolCallID] {
+			// 跳过无法核验归属的工具结果。合成 id（call_repaired_ 前缀）不会进入
+			// validToolCallIDs，因此不能仅因"历史中存在其它真实 id"就丢弃它们，
+			// 否则 GLM 只会看到 function_calls 调用块而看不到对应结果（表现为"没有工具结果"）。
+			if toolCallID != "" && !strings.HasPrefix(toolCallID, "call_repaired_") && len(validToolCallIDs) > 0 && !validToolCallIDs[toolCallID] {
 				continue
 			}
 			if toolCallID != "" && repairedToolCallIDs[toolCallID] {
@@ -743,13 +943,27 @@ func ConvertMessages(
 		}
 	}
 
-	// 拼接完整提示词：工具定义 + 对话历史
+	// 拼接完整提示词：工具定义 + 工作目录/已知路径 + 对话历史
 	var transcriptParts []string
 	if len(toolsList) > 0 {
-		transcriptParts = append(transcriptParts,
-			tools.ToolsToPrompt(toolsList, serverSideToolNames),
-			"# CONVERSATION",
-		)
+		// 从对话上下文推断真实工作目录与文件路径：用于工具调用示例与 # WORKSPACE 段，
+		// 减少模型臆造/用错路径导致的工具调用失败
+		paths, root := collectWorkspacePaths(messages)
+		exampleFile := pickExampleFile(paths, root)
+		exampleDir := root
+		if exampleDir == "" && exampleFile != "" {
+			if i := strings.LastIndexAny(exampleFile, `\/`); i > 0 {
+				exampleDir = exampleFile[:i]
+			}
+		}
+		transcriptParts = append(transcriptParts, tools.ToolsToPrompt(toolsList, serverSideToolNames, tools.ExamplePaths{
+			Dir:  exampleDir,
+			File: exampleFile,
+		}))
+		if section := buildWorkspaceSection(paths, root); section != "" {
+			transcriptParts = append(transcriptParts, section)
+		}
+		transcriptParts = append(transcriptParts, "# CONVERSATION")
 	}
 	// 格式化对话历史：每条消息以角色名开头
 	for _, item := range processed {
@@ -1090,6 +1304,16 @@ func (a *GLMEventAccumulator) Finalize(status string, lastError map[string]any) 
 	jsonToolCalls := a.toolParser.Flush()
 	a.Logger.Info("finalize: tool parser flush", "jsonToolCalls", jsonToolCalls)
 	jsonToolCalls = SanitizeToolCalls(jsonToolCalls, a.FallbackToolURL, a.ToolsList)
+	// 兜底：模型有时会把工具调用输出在思考内容（think）里而正文（text）为空，
+	// 此时常规文本解析得不到任何调用；若不回退到推理内容中提取，
+	// 客户端只会收到 reasoning_content，既没有 tool_calls 也没有 content（有思考但无返回）。
+	// 已有服务端原生工具调用时跳过，避免与已收集的调用重复。
+	if len(jsonToolCalls) == 0 && len(a.serverSideToolCalls) == 0 {
+		if reasoningToolCalls := a.extractReasoningToolCalls(""); len(reasoningToolCalls) > 0 {
+			jsonToolCalls = reasoningToolCalls
+			a.Logger.Info("finalize: 从推理内容中提取到工具调用", "count", len(reasoningToolCalls))
+		}
+	}
 	// 合并服务端工具调用和 JSON 工具调用，重新索引
 	allToolCalls := make([]map[string]any, len(a.serverSideToolCalls))
 	copy(allToolCalls, a.serverSideToolCalls)

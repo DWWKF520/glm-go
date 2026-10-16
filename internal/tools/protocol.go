@@ -311,7 +311,7 @@ const (
 // toolName 用于参数名启发式的上下文判断（如 pattern 对 Glob 是通配符、对 Grep 是正则）。
 // required 参数按声明顺序全部包含，其余可选参数按字母序采样（上限 maxSampleProps），
 // 保证同一 schema 生成结果稳定。无 properties 时返回空 map。
-func SampleArgumentsFromSchema(toolName string, parameters any) map[string]any {
+func SampleArgumentsFromSchema(toolName string, parameters any, ep ExamplePaths) map[string]any {
 	m, ok := parameters.(map[string]any)
 	if !ok {
 		return map[string]any{}
@@ -320,16 +320,16 @@ func SampleArgumentsFromSchema(toolName string, parameters any) map[string]any {
 	if len(props) == 0 {
 		return map[string]any{}
 	}
-	return sampleArgsFromProperties(toolName, props, requiredList(m), 0)
+	return sampleArgsFromProperties(toolName, props, requiredList(m), 0, ep)
 }
 
 // sampleArgsFromProperties 按 "required 优先（声明序）+ 其余字母序" 的确定性顺序
 // 从 properties 中采样示例参数，depth 为当前嵌套深度。
-func sampleArgsFromProperties(toolName string, props map[string]any, required []string, depth int) map[string]any {
+func sampleArgsFromProperties(toolName string, props map[string]any, required []string, depth int, ep ExamplePaths) map[string]any {
 	result := make(map[string]any)
 	for _, name := range required {
 		if schema, ok := props[name]; ok {
-			result[name] = sampleValue(toolName, name, schema, depth)
+			result[name] = sampleValue(toolName, name, schema, depth, ep)
 		}
 	}
 	var rest []string
@@ -343,14 +343,14 @@ func sampleArgsFromProperties(toolName string, props map[string]any, required []
 		rest = rest[:maxSampleProps]
 	}
 	for _, name := range rest {
-		result[name] = sampleValue(toolName, name, props[name], depth)
+		result[name] = sampleValue(toolName, name, props[name], depth, ep)
 	}
 	return result
 }
 
 // sampleValue 根据单个参数的名称与 schema 生成一个贴近真实用法的示例值。
 // 优先级：default > enum 首个值 > 按 type 与参数名启发式生成。
-func sampleValue(toolName, paramName string, schema any, depth int) any {
+func sampleValue(toolName, paramName string, schema any, depth int, ep ExamplePaths) any {
 	m, ok := schema.(map[string]any)
 	if !ok {
 		return "value"
@@ -364,44 +364,92 @@ func sampleValue(toolName, paramName string, schema any, depth int) any {
 	t, _ := m["type"].(string)
 	switch t {
 	case "string":
-		return sampleStringValue(toolName, paramName)
+		return sampleStringValue(toolName, paramName, ep)
 	case "integer", "number":
 		return sampleNumberValue(paramName)
 	case "boolean":
 		return sampleBoolValue(paramName)
 	case "array":
 		if items, ok := m["items"]; ok && depth < maxSampleDepth {
-			return []any{sampleValue(toolName, paramName, items, depth+1)}
+			return []any{sampleValue(toolName, paramName, items, depth+1, ep)}
 		}
 		return []any{}
 	case "object":
 		if props, ok := m["properties"].(map[string]any); ok && len(props) > 0 && depth < maxSampleDepth {
-			return sampleArgsFromProperties(toolName, props, requiredList(m), depth+1)
+			return sampleArgsFromProperties(toolName, props, requiredList(m), depth+1, ep)
 		}
 		return map[string]any{}
 	}
 	return "value"
 }
 
+// ExamplePaths 供工具调用示例使用的真实路径（从对话上下文推断得到）。
+// 为空时示例沿用通用占位值（e:\project\...）；非空时改用用户真实工作目录下的路径，
+// 避免模型照抄虚构示例路径导致工具调用失败。
+type ExamplePaths struct {
+	Dir  string // 工作目录，用于目录类参数（dir/folder/path+dir 等）
+	File string // 真实文件路径，用于文件类参数
+}
+
+// dir 返回目录类示例路径；无真实值时退回通用占位值。
+func (p ExamplePaths) dir() string {
+	if p.Dir != "" {
+		return p.Dir
+	}
+	return `e:\project\src`
+}
+
+// file 返回文件类示例路径；无真实文件时用工作目录下的通用占位文件名。
+func (p ExamplePaths) file() string {
+	if p.File != "" {
+		return p.File
+	}
+	if p.Dir != "" {
+		return p.Dir + pathSepOf(p.Dir) + "example.txt"
+	}
+	return `e:\project\src\app.tsx`
+}
+
+// root 返回工作目录类示例路径；无真实值时退回通用占位值。
+func (p ExamplePaths) root() string {
+	if p.Dir != "" {
+		return p.Dir
+	}
+	return `e:\project`
+}
+
+// uri 返回 file:// 形式的示例路径（基于 file()）。
+func (p ExamplePaths) uri() string {
+	return "file:///" + strings.ReplaceAll(p.file(), `\`, "/")
+}
+
+// pathSepOf 依据路径风格返回分隔符（Windows 用 \，POSIX 用 /）。
+func pathSepOf(p string) string {
+	if strings.ContainsRune(p, '\\') {
+		return `\`
+	}
+	return "/"
+}
+
 // sampleStringValue 按参数名（结合工具名上下文）启发式生成字符串示例值，
-// 均为常见约定值，便于模型模仿。
-func sampleStringValue(toolName, name string) string {
+// 均为常见约定值，便于模型模仿；路径类参数优先使用真实工作目录（见 ExamplePaths）。
+func sampleStringValue(toolName, name string, ep ExamplePaths) string {
 	n := strings.ToLower(name)
 	switch {
 	case strings.Contains(n, "command_id"), strings.Contains(n, "cmd_id"):
 		return "cmd_123456"
 	case strings.Contains(n, "path") && strings.Contains(n, "dir"):
-		return "e:\\project\\src"
+		return ep.dir()
 	case strings.Contains(n, "path"), strings.Contains(n, "file"):
-		return "e:\\project\\src\\app.tsx"
+		return ep.file()
 	case n == "cwd", strings.Contains(n, "workdir"), strings.Contains(n, "working_dir"):
-		return "e:\\project"
+		return ep.root()
 	case strings.Contains(n, "dir"), strings.Contains(n, "folder"):
-		return "e:\\project\\src"
+		return ep.dir()
 	case strings.Contains(n, "url"):
 		return "https://example.com/docs"
 	case strings.Contains(n, "uri"):
-		return "file:///e:/project/src/app.tsx"
+		return ep.uri()
 	case strings.Contains(n, "pattern"):
 		// Glob 类工具的 pattern 是通配符，其余（如 Grep）按正则示例展示转义写法
 		if strings.Contains(strings.ToLower(toolName), "glob") || strings.Contains(n, "glob") || strings.Contains(n, "wildcard") {
@@ -464,8 +512,9 @@ func requiredList(schema map[string]any) []string {
 // 并根据参数 schema 自动生成该工具的 [function_calls] 调用示例（Example 段），
 // 与通用协议指令 tx 拼接为完整的提示词。
 // serverSideToolNames 指定服务端工具集合。
+// ep 提供从对话上下文推断出的真实工作目录/文件路径，用于替换示例中的虚构路径。
 // 返回过滤掉空段落后的完整提示词文本。
-func ToolsToPrompt(tools []map[string]any, serverSideToolNames map[string]bool) string {
+func ToolsToPrompt(tools []map[string]any, serverSideToolNames map[string]bool, ep ExamplePaths) string {
 	var toolNames []string
 	var toolSchemas []string
 	for _, tool := range tools {
@@ -489,7 +538,7 @@ func ToolsToPrompt(tools []map[string]any, serverSideToolNames map[string]bool) 
 		}
 		schemaSection := "### " + name + "\n" + description + "\nParameters: " + paramsJSON
 		// 从参数 schema 自动生成示例调用，内嵌到该工具段落中
-		if sampleArgs := SampleArgumentsFromSchema(name, parameters); len(sampleArgs) > 0 {
+		if sampleArgs := SampleArgumentsFromSchema(name, parameters, ep); len(sampleArgs) > 0 {
 			schemaSection += "\nExample:\n" + SerializeToolCallBlock(name, sampleArgs)
 		}
 		toolSchemas = append(toolSchemas, schemaSection)
