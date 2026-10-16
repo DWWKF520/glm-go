@@ -1,0 +1,20 @@
+# 版本控制与 IDE
+.git
+.gitignore
+.vscode
+
+# 敏感配置：严禁打进镜像，运行时通过 compose 挂载或 env_file 注入
+.env
+token.txt
+
+# 本地构建产物与缓存
+*.exe
+*.log
+.gomodcache/
+utils/
+
+# 与镜像无关的文件
+Dockerfile
+docker-compose.yml
+.dockerignore
+prompt.txt

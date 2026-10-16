@@ -1,0 +1,21 @@
+services:
+  glm2api:
+    build: .
+    image: glm2api:latest
+    container_name: glm2api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # 容器内必须监听 0.0.0.0，否则端口映射不通
+      # 程序逻辑：环境变量优先于 .env 文件，因此这里的值会覆盖 .env 中的 HOST
+      HOST: 0.0.0.0
+      PORT: "8000"
+    # 其余配置从宿主机 .env 注入（GLM_REFRESH_TOKEN、SERVER_API_KEYS、并发数等）
+    # 若不想用 env_file，也可以改为逐项写在上面的 environment 里
+    env_file:
+      - .env
+    volumes:
+      # 多账号 token 文件：refresh token 自动轮换后会写回此文件，必须挂载持久化
+      # Linux 宿主机上注意保证该文件对容器内 uid 10001 可写
+      - ./token.txt:/app/token.txt
